@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
 :root{
   --ink:#14140f;--ink-2:#6b6b62;--ink-3:#a3a39a;
@@ -195,15 +196,13 @@ body{font-family:var(--sans);font-size:14px;color:var(--ink);
   padding:2px 8px;border-radius:100px;margin-left:8px;
 }
 
-@media(max-width:700px){
-  .charts-grid{grid-template-columns:1fr;}
-  .stat-row{grid-template-columns:1fr 1fr;}
-  .outer{flex-direction:column;}
-  .sidenav{width:100%;height:auto;position:static;
-           display:flex;flex-wrap:wrap;gap:4px;padding:12px;}
-  .sidenav-title{display:none;}
+@media print {
+  body * { visibility: hidden; }
+  .topbar, .sidenav, .btn, .share-row:not(:last-child), .page-header { display: none !important; }
+  #tab-sharing, #tab-sharing * { visibility: visible; }
+  #tab-sharing { display: block !important; position: absolute; left: 0; top: 0; width: 100%; padding: 40px; text-align: center; }
+  #surveyQrcode { margin: 20px auto; }
 }
-
 </style>
 </head>
 <body>
@@ -558,7 +557,7 @@ body{font-family:var(--sans);font-size:14px;color:var(--ink);
         <div class="share-row">
           <div class="share-label">
             <div class="share-label-title">Access code</div>
-            <div class="share-label-desc">Share this with respondents to enter on the code page</div>
+            <div class="share-label-desc">Share this with respondents to enter on the code page or mobile app</div>
           </div>
           <div class="share-value-wrap">
             <span class="share-value share-code" id="accessCode">
@@ -566,6 +565,29 @@ body{font-family:var(--sans);font-size:14px;color:var(--ink);
             </span>
             <button class="copy-btn"
                     onclick="copyText('accessCode',this)">Copy</button>
+          </div>
+        </div>
+
+        <div class="share-row" style="align-items:center;">
+          <div class="share-label">
+            <div class="share-label-title">Scan QR code</div>
+            <div class="share-label-desc">Project in lecture hall or print for classroom handouts</div>
+          </div>
+          <div class="share-value-wrap" style="flex-direction:column;align-items:flex-start;gap:12px;">
+            <div style="background:#fff;padding:12px;border:1px solid var(--line);border-radius:8px;display:inline-block;">
+              <div id="surveyQrcode"></div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-dark" onclick="downloadQRCode()">
+                ↓ Download QR (PNG)
+              </button>
+              <button type="button" class="btn btn-outline" onclick="window.print()">
+                🖨️ Print Placard
+              </button>
+            </div>
+            <p style="font-size:12px;color:var(--ink-2);margin-top:2px;">
+              💡 <strong>Mobile / Tablet:</strong> Scanning with regular phone cameras opens the mobile web survey. Feedora Mobile app users can also enter code <strong>{{ survey.access_code }}</strong> directly.
+            </p>
           </div>
         </div>
       </div>
@@ -799,7 +821,39 @@ function escHtml(s){
 }
 
 // Build charts on load since dashboard is default tab
-document.addEventListener('DOMContentLoaded', buildCharts);
+document.addEventListener('DOMContentLoaded', () => {
+  buildCharts();
+  initSurveyQrCode();
+});
+
+function initSurveyQrCode() {
+  const qrContainer = document.getElementById('surveyQrcode');
+  const directLinkEl = document.getElementById('directLink');
+  if (!qrContainer || !directLinkEl) return;
+
+  const targetUrl = directLinkEl.textContent.trim();
+  qrContainer.innerHTML = '';
+  new QRCode(qrContainer, {
+    text: targetUrl,
+    width: 160,
+    height: 160,
+    colorDark: '#14140f',
+    colorLight: '#ffffff',
+    correctLevel: QRCode.CorrectLevel.M,
+  });
+}
+
+function downloadQRCode() {
+  const img = document.querySelector('#surveyQrcode img') || document.querySelector('#surveyQrcode canvas');
+  if (!img) return;
+
+  const link = document.createElement('a');
+  link.download = 'survey-{{ survey.access_code }}-qr.png';
+  link.href = img.tagName.toLowerCase() === 'canvas' ? img.toDataURL('image/png') : img.src;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
 
 // Re-open respondent tab if page was reloaded with response_id param
 const urlParams = new URLSearchParams(window.location.search);
