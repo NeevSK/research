@@ -984,9 +984,51 @@ def api_creator_create_survey(request):
         'uuid': str(survey.access_uuid),
         'accessCode': survey.access_code,
         'surveyId': survey.id,
+        'isDraft': survey.is_draft,
+        'isActive': survey.is_active,
         'questionsCount': survey.questions.count(),
     }, status=201)
 
+
+@require_POST
+def api_creator_toggle_publish(request, access_uuid):
+    """Toggle survey between draft (private) and published (active/public)."""
+    if not request.user.is_authenticated:
+        return JsonResponse({'ok': False, 'error': 'Authentication required.'}, status=401)
+
+    is_staff_or_admin = request.user.is_staff or request.user.is_superuser
+    if not (request.user.role == 'creator' or is_staff_or_admin):
+        return JsonResponse({'ok': False, 'error': 'Creator permissions required.'}, status=403)
+
+    survey = Survey.objects.filter(access_uuid=access_uuid).first()
+    if not survey:
+        return JsonResponse({'ok': False, 'error': 'Survey not found.'}, status=404)
+
+    if not is_staff_or_admin and survey.organization != request.user:
+        return JsonResponse({'ok': False, 'error': 'Not authorized to modify this survey.'}, status=403)
+
+    try:
+        data = json.loads(request.body) if request.body else {}
+    except Exception:
+        data = {}
+
+    make_draft = data.get('is_draft', None)
+    if make_draft is None:
+        survey.is_draft = not survey.is_draft
+    else:
+        survey.is_draft = bool(make_draft)
+
+    survey.is_active = not survey.is_draft
+    survey.save(update_fields=['is_draft', 'is_active'])
+
+    return JsonResponse({
+        'ok': True,
+        'uuid': str(survey.access_uuid),
+        'accessCode': survey.access_code,
+        'isDraft': survey.is_draft,
+        'isActive': survey.is_active,
+        'status': 'draft' if survey.is_draft else 'published',
+    })
 
 
 @require_GET

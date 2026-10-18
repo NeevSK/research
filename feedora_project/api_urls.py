@@ -13,6 +13,7 @@ urlpatterns = [
     path('surveys/', api_views.api_surveys_list, name='api_surveys_list'),
     path('surveys/mine/', api_views.api_creator_surveys, name='api_creator_surveys'),
     path('surveys/create/', api_views.api_creator_create_survey, name='api_creator_create_survey'),
+    path('surveys/<uuid:access_uuid>/publish/', api_views.api_creator_toggle_publish, name='api_creator_toggle_publish'),
     path('surveys/<uuid:access_uuid>/meta/', api_views.api_survey_meta, name='api_survey_meta'),
     path('surveys/code/<str:access_code>/meta/', api_views.api_survey_meta_by_code, name='api_survey_meta_by_code'),
     path('surveys/<uuid:access_uuid>/submit/', api_views.api_survey_submit, name='api_survey_submit'),
