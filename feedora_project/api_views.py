@@ -451,10 +451,32 @@ def api_entity_join(request, entity_id):
 
 @require_GET
 def api_surveys_list(request):
-    """List active surveys available for participation."""
+    """List active surveys available for participation, enriched with archetypes and access policies."""
     surveys = Survey.objects.filter(is_active=True).order_by('-created_at')[:50]
     items = []
     for s in surveys:
+        # Determine archetype kind
+        kind = 'survey'
+        if s.is_hmsam:
+            kind = 'survey'
+        elif 'quiz' in (s.title or '').lower():
+            kind = 'quiz'
+        elif 'exam' in (s.title or '').lower():
+            kind = 'exam'
+        elif 'intake' in (s.title or '').lower():
+            kind = 'intake'
+
+        allow_multi = bool(s.features.get('allow_multiple_submissions', False))
+        if kind == 'quiz':
+            allow_redo = True
+            reward_strat = 'score_delta'
+        elif kind == 'survey':
+            allow_redo = allow_multi
+            reward_strat = 'first_attempt_only'
+        else:
+            allow_redo = allow_multi
+            reward_strat = 'first_attempt_only'
+
         items.append({
             'id': s.id,
             'uuid': str(s.access_uuid),
@@ -462,7 +484,14 @@ def api_surveys_list(request):
             'title': s.title,
             'description': s.description or '',
             'isHmsam': s.is_hmsam,
+            'kind': kind,
+            'accessPolicy': {
+                'allowRedo': allow_redo,
+                'maxAttempts': 1 if not allow_redo else None,
+                'rewardStrategy': reward_strat,
+            },
             'questionsCount': s.questions.count(),
+            'createdAt': s.created_at.isoformat() if s.created_at else None,
         })
     return JsonResponse({'ok': True, 'surveys': items})
 
