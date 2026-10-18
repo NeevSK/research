@@ -66,6 +66,14 @@ def _serialize_user(user, persona=None):
     except Exception:
         pass
 
+    badges = []
+    if surveys_completed >= 1:
+        badges.append({'id': 'bronze', 'label': 'Bronze', 'icon': '🥉', 'rule': 'First-time respondent', 'earned': True})
+    if surveys_completed >= 5:
+        badges.append({'id': 'silver', 'label': 'Silver', 'icon': '🥈', 'rule': '5 responses total', 'earned': True})
+    if surveys_completed > 5:
+        badges.append({'id': 'gold', 'label': 'Gold', 'icon': '🥇', 'rule': 'More than 5 responses', 'earned': True})
+
     return {
         'id': user.id,
         'username': user.username,
@@ -78,6 +86,7 @@ def _serialize_user(user, persona=None):
         'avatar': avatar,
         'totalPoints': total_points,
         'surveysCompleted': surveys_completed,
+        'badges': badges,
         'levelInfo': level_info,
         'organization': org_data,
     }
@@ -288,13 +297,151 @@ def api_respondent_history(request):
         for k, v in sorted(points_by_org.items(), key=lambda x: x[1], reverse=True)
     ]
 
+    submissions_count = len(history_items)
+    badges = []
+    if submissions_count >= 1:
+        badges.append({'id': 'bronze', 'label': 'Bronze', 'icon': '🥉', 'rule': 'First-time respondent', 'earned': True})
+    if submissions_count >= 5:
+        badges.append({'id': 'silver', 'label': 'Silver', 'icon': '🥈', 'rule': '5 responses total', 'earned': True})
+    if submissions_count > 5:
+        badges.append({'id': 'gold', 'label': 'Gold', 'icon': '🥇', 'rule': 'More than 5 responses', 'earned': True})
+
     return JsonResponse({
         'ok': True,
         'totalPoints': total_points,
         'levelInfo': get_level_info(total_points),
-        'submissionsCount': len(history_items),
+        'submissionsCount': submissions_count,
+        'badges': badges,
         'history': history_items,
         'pointsByOrganization': sorted_org_points,
+    })
+
+
+@require_GET
+def api_entities_list(request):
+    """List organizations and institutions hosting surveys on Feedora."""
+    from accounts.models import Organization
+
+    orgs = Organization.objects.select_related('user').all()
+    entities = []
+    seen_user_ids = set()
+
+    for org in orgs:
+        seen_user_ids.add(org.user_id)
+        active_surveys_count = Survey.objects.filter(organization=org.user, is_active=True).count()
+        entities.append({
+            'id': org.id,
+            'entityId': f"org-{org.id}",
+            'name': org.org_name or f"{org.user.email}'s Lab",
+            'type': org.org_type or 'university',
+            'userRole': org.user_role or '',
+            'country': org.country or '',
+            'creatorEmail': org.user.email,
+            'activeSurveysCount': active_surveys_count,
+        })
+
+    creators_with_surveys = User.objects.filter(
+        surveys__is_active=True
+    ).exclude(id__in=seen_user_ids).distinct()
+
+    for u in creators_with_surveys:
+        org_name = 'Independent Research'
+        if hasattr(u, 'creator_profile') and u.creator_profile.company:
+            org_name = u.creator_profile.company
+        elif u.first_name or u.last_name:
+            org_name = f"{u.first_name} {u.last_name}".strip()
+
+        active_count = Survey.objects.filter(organization=u, is_active=True).count()
+        entities.append({
+            'id': u.id,
+            'entityId': f"user-{u.id}",
+            'name': org_name,
+            'type': 'research',
+            'userRole': 'Principal Investigator',
+            'country': '',
+            'creatorEmail': u.email,
+            'activeSurveysCount': active_count,
+        })
+
+    return JsonResponse({'ok': True, 'entities': entities})
+
+
+@require_GET
+def api_entity_surveys(request, entity_id):
+    """List active surveys published by a specific organization or creator."""
+    from accounts.models import Organization
+
+    target_user = None
+    org_obj = Organization.objects.filter(id=entity_id).select_related('user').first()
+    if org_obj:
+        target_user = org_obj.user
+        org_name = org_obj.org_name
+    else:
+        user_candidate = User.objects.filter(id=entity_id).first()
+        if user_candidate:
+            target_user = user_candidate
+            org_name = (
+                user_candidate.creator_profile.company
+                if hasattr(user_candidate, 'creator_profile') and user_candidate.creator_profile.company
+                else user_candidate.email
+            )
+        else:
+            return JsonResponse({'ok': False, 'error': 'Entity not found.'}, status=404)
+
+    surveys = Survey.objects.filter(organization=target_user, is_active=True).order_by('-created_at')
+    items = []
+    for s in surveys:
+        items.append({
+            'id': s.id,
+            'uuid': str(s.access_uuid),
+            'accessCode': s.access_code,
+            'title': s.title,
+            'description': s.description or '',
+            'isHmsam': s.is_hmsam,
+            'questionsCount': s.questions.count(),
+        })
+
+    return JsonResponse({
+        'ok': True,
+        'entity': {
+            'id': entity_id,
+            'name': org_name,
+        },
+        'surveys': items,
+    })
+
+
+@csrf_exempt
+@require_POST
+def api_entity_join(request, entity_id):
+    """Associate authenticated respondent with an organization/entity."""
+    if not request.user.is_authenticated:
+        return JsonResponse({'ok': False, 'error': 'Authentication required.'}, status=401)
+
+    from accounts.models import Organization, RespondentProfile
+    target_org = Organization.objects.filter(id=entity_id).first()
+    org_name = target_org.org_name if target_org else 'Independent'
+    org_type = target_org.org_type if target_org else 'university'
+    country = target_org.country if target_org else ''
+
+    user_org, _ = Organization.objects.get_or_create(user=request.user)
+    user_org.org_name = org_name
+    user_org.org_type = org_type
+    user_org.country = country
+    user_org.save()
+
+    profile, _ = RespondentProfile.objects.get_or_create(user=request.user)
+    profile.company = org_name
+    profile.save(update_fields=['company'])
+
+    return JsonResponse({
+        'ok': True,
+        'message': f'Successfully joined {org_name}.',
+        'organization': {
+            'orgName': user_org.org_name,
+            'orgType': user_org.org_type,
+            'country': user_org.country,
+        },
     })
 
 

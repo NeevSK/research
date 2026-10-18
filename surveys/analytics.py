@@ -117,21 +117,38 @@ def get_hmsam_scores(survey):
         values = list(answers)
         n      = len(values)
 
-        weighted_sum = sum(values)
-        max_possible = 5 * n
-        score        = round((weighted_sum / max_possible) * 100, 1)
-        mean         = round(sum(values) / n, 2)
+        # Scale detection: support 1..5, 1..7, 1..10, and bipolar scales (-5..+5)
+        max_scale_val = max([q.rating_max for q in qs if q.rating_max] or [5])
+        min_scale_val = min(values) if min(values) < 1 else 1
 
-        # Response distribution (1–5)
-        distribution = {i: values.count(i) for i in range(1, 6)}
+        scale_span = max(1, max_scale_val - min_scale_val)
+        mean = round(sum(values) / n, 2)
+
+        # Dual scoring (D2):
+        # 1. Raw percentage score (paper formula): (weighted_sum / (max_scale * n)) * 100
+        raw_percentage = round((sum(values) / (max_scale_val * n)) * 100, 1) if max_scale_val > 0 else 0.0
+        # 2. Normalized interval percentage: ((mean - min) / (max - min)) * 100
+        interval_score = round(max(0.0, min(100.0, ((mean - min_scale_val) / scale_span) * 100)), 1)
+
+        # For standard 1..5 scale, raw_percentage is the original paper formula
+        score = raw_percentage if (min_scale_val == 1 and max_scale_val == 5) else interval_score
+
+        # Response distribution across all values in the scale
+        dist_min = min(min_scale_val, min(values))
+        dist_max = max(max_scale_val, max(values))
+        distribution = {i: values.count(i) for i in range(dist_min, dist_max + 1)}
 
         construct_scores[construct_key] = {
-            'label':          CONSTRUCT_LABELS[construct_key],
-            'score':          score,
-            'mean':           mean,
-            'count':          n,
-            'distribution':   distribution,
-            'interpretation': get_score_interpretation(score),
+            'label':            CONSTRUCT_LABELS[construct_key],
+            'score':            score,
+            'raw_percentage':   raw_percentage,
+            'normalized_score': interval_score,
+            'mean':             mean,
+            'scale_min':        min_scale_val,
+            'scale_max':        max_scale_val,
+            'count':            n,
+            'distribution':     distribution,
+            'interpretation':   get_score_interpretation(score),
         }
 
     if construct_scores:
@@ -244,10 +261,20 @@ def get_response_distribution(survey):
         }
 
         if q.question_type in ['likert', 'rating']:
-            labels = ['Strongly Disagree', 'Disagree', 'Neutral', 'Agree', 'Strongly Agree']
-            for i, label in enumerate(labels, 1):
+            q_max = q.rating_max or 5
+            if q_max == 5:
+                labels = {1: 'Strongly Disagree', 2: 'Disagree', 3: 'Neutral', 4: 'Agree', 5: 'Strongly Agree'}
+            elif q_max == 7:
+                labels = {1: 'Strongly Disagree', 2: 'Disagree', 3: 'Somewhat Disagree', 4: 'Neutral', 5: 'Somewhat Agree', 6: 'Agree', 7: 'Strongly Agree'}
+            else:
+                labels = {i: f"Rating {i}" for i in range(1, q_max + 1)}
+
+            existing_vals = set(Answer.objects.filter(question=q, likert_value__isnull=False).values_list('likert_value', flat=True))
+            all_keys = sorted(set(labels.keys()) | existing_vals)
+            for i in all_keys:
+                lbl = labels.get(i, f"Rating {i}")
                 count = Answer.objects.filter(question=q, likert_value=i).count()
-                item['data'].append({'label': label, 'count': count})
+                item['data'].append({'label': lbl, 'count': count})
 
         elif q.question_type == 'mcq':
             for opt in q.options.all():
@@ -341,9 +368,14 @@ def get_respondent_answers(response_obj):
         if not ans:
             value = '—'
         elif ans.likert_value is not None:
-            labels = {1:'Strongly Disagree', 2:'Disagree', 3:'Neutral',
-                      4:'Agree', 5:'Strongly Agree'}
-            value = labels.get(ans.likert_value, str(ans.likert_value))
+            q_max = q.rating_max or 5
+            if q_max == 5:
+                labels = {1: 'Strongly Disagree', 2: 'Disagree', 3: 'Neutral', 4: 'Agree', 5: 'Strongly Agree'}
+            elif q_max == 7:
+                labels = {1: 'Strongly Disagree', 2: 'Disagree', 3: 'Somewhat Disagree', 4: 'Neutral', 5: 'Somewhat Agree', 6: 'Agree', 7: 'Strongly Agree'}
+            else:
+                labels = {}
+            value = labels.get(ans.likert_value, f"{ans.likert_value} / {q_max}")
         elif ans.text_value:
             value = ans.text_value
         elif ans.selected_option:

@@ -241,3 +241,117 @@ class Phase1DataIntegrityTests(TestCase):
         )
         self.assertEqual(res_with_token.status_code, 200)
         self.assertTrue(res_with_token.json()['ok'])
+
+    def test_entities_list_and_surveys(self):
+        """Entities list endpoint returns active organizations and their surveys."""
+        from accounts.models import Organization
+        org = Organization.objects.create(
+            user=self.creator,
+            org_name='University of Moratuwa',
+            org_type='university',
+            user_role='Lead Researcher',
+            country='Sri Lanka',
+        )
+
+        res = self.client.get('/api/v1/entities/')
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertTrue(data['ok'])
+        self.assertTrue(any(e['name'] == 'University of Moratuwa' for e in data['entities']))
+
+        surveys_res = self.client.get(f'/api/v1/entities/{org.id}/surveys/')
+        self.assertEqual(surveys_res.status_code, 200)
+        s_data = surveys_res.json()
+        self.assertTrue(s_data['ok'])
+        self.assertEqual(len(s_data['surveys']), 1)
+        self.assertEqual(s_data['surveys'][0]['title'], 'Empirical HMSAM Study')
+
+    def test_entity_join_authenticated(self):
+        """Respondent can join an organization, updating both Organization and RespondentProfile."""
+        from accounts.models import Organization
+        org = Organization.objects.create(
+            user=self.creator,
+            org_name='MIT Media Lab',
+            org_type='research',
+            country='USA',
+        )
+
+        # Anonymous request should return 401
+        res_anon = self.client.post(f'/api/v1/entities/{org.id}/join/')
+        self.assertEqual(res_anon.status_code, 401)
+
+        # Authenticated respondent joins successfully
+        user = User.objects.create_user(
+            username='joiner@feedora.org',
+            email='joiner@feedora.org',
+            password='Password123!',
+            role='respondent',
+        )
+        self.client.force_login(user)
+        res_auth = self.client.post(f'/api/v1/entities/{org.id}/join/')
+        self.assertEqual(res_auth.status_code, 200)
+        self.assertTrue(res_auth.json()['ok'])
+        self.assertEqual(res_auth.json()['organization']['orgName'], 'MIT Media Lab')
+
+    def test_respondent_history_badges_and_points_by_organization(self):
+        """History endpoint returns cumulative points, level info, badges, and per-organization aggregation."""
+        from accounts.models import Organization
+        Organization.objects.create(
+            user=self.creator,
+            org_name='University of Colombo',
+            org_type='university',
+            country='Sri Lanka',
+        )
+        user = User.objects.create_user(
+            username='badge_earner@feedora.org',
+            email='badge_earner@feedora.org',
+            password='Password123!',
+            role='respondent',
+        )
+        self.client.force_login(user)
+
+        # Submit first response -> earns Bronze badge
+        url = f'/api/v1/surveys/{self.survey.access_uuid}/submit/'
+        res = self.client.post(
+            url,
+            data=json.dumps({'submissionId': str(uuid.uuid4()), 'answers': {'JOY1': 4}}),
+            content_type='application/json',
+        )
+        self.assertEqual(res.status_code, 200)
+
+        history_res = self.client.get('/api/v1/respondent/history/')
+        self.assertEqual(history_res.status_code, 200)
+        h_data = history_res.json()
+        self.assertTrue(h_data['ok'])
+        self.assertEqual(h_data['submissionsCount'], 1)
+        self.assertTrue(any(b['id'] == 'bronze' for b in h_data['badges']))
+        self.assertTrue(any(o['organization'] == 'University of Colombo' for o in h_data['pointsByOrganization']))
+
+    def test_arbitrary_rating_scale_analytics_dual_scoring(self):
+        """Analytics engine handles 7-point scales with normalized interval scores without distortion."""
+        from surveys.models import Survey, Question, Response, Answer
+        from surveys.analytics import get_hmsam_scores
+
+        s7 = Survey.objects.create(
+            organization=self.creator,
+            title='7-Point Likert Study',
+            is_active=True,
+        )
+        q7 = Question.objects.create(
+            survey=s7,
+            code='JOY1',
+            text='Enjoyment on 7-point scale',
+            question_type='likert',
+            hmsam_construct='joy',
+            rating_max=7,
+            order=1,
+        )
+        resp = Response.objects.create(survey=s7, user=self.creator)
+        Answer.objects.create(response=resp, question=q7, likert_value=7)
+
+        scores, overall = get_hmsam_scores(s7)
+        self.assertIn('joy', scores)
+        # Max on 7-point scale should normalize to 100%
+        self.assertEqual(scores['joy']['normalized_score'], 100.0)
+        self.assertEqual(scores['joy']['scale_max'], 7)
+        self.assertEqual(scores['joy']['mean'], 7.0)
