@@ -306,12 +306,149 @@ def get_hmsam_construct_reliabilities(survey, variant=None):
     return results
 
 
+import math
+
+
+def _student_t_pdf(x, df):
+    """Probability density function of Student's t-distribution with df degrees of freedom."""
+    c = math.exp(math.lgamma((df + 1.0) / 2.0) - math.lgamma(df / 2.0)) / math.sqrt(math.pi * df)
+    return c * (1.0 + (x * x) / df) ** (-(df + 1.0) / 2.0)
+
+
+def _student_t_cdf(t_val, df, steps=100):
+    """Cumulative distribution function of Student's t using Simpson's quadrature."""
+    if t_val == 0.0:
+        return 0.5
+    x_max = abs(t_val)
+    h = x_max / float(steps)
+    area = _student_t_pdf(0.0, df) + _student_t_pdf(x_max, df)
+    for i in range(1, steps):
+        x = i * h
+        weight = 4.0 if i % 2 == 1 else 2.0
+        area += weight * _student_t_pdf(x, df)
+    integral = (h / 3.0) * area
+    cdf = 0.5 + integral if t_val > 0.0 else 0.5 - integral
+    return max(0.0, min(1.0, cdf))
+
+
+def compute_welch_t_test(sample_a, sample_b):
+    """
+    Computes Welch's t-test (unequal variances) and Hedges' g effect size.
+    Returns dict with t-stat, df, two-tailed p-value, Hedges' g, and significance label.
+    """
+    n_a = len(sample_a)
+    n_b = len(sample_b)
+    if n_a < 2 or n_b < 2:
+        return {
+            'tStatistic': None,
+            'degreesOfFreedom': None,
+            'pValue': None,
+            'hedgesG': None,
+            'effectSize': 'insufficient_data',
+            'isSignificant': False,
+            'significanceMarker': 'ns',
+        }
+
+    mean_a = sum(sample_a) / float(n_a)
+    mean_b = sum(sample_b) / float(n_b)
+
+    var_a = sum((x - mean_a) ** 2 for x in sample_a) / float(n_a - 1)
+    var_b = sum((x - mean_b) ** 2 for x in sample_b) / float(n_b - 1)
+
+    se_a = var_a / float(n_a)
+    se_b = var_b / float(n_b)
+    se_diff = math.sqrt(se_a + se_b)
+
+    if se_diff == 0.0:
+        return {
+            'tStatistic': 0.0,
+            'degreesOfFreedom': float(n_a + n_b - 2),
+            'pValue': 1.0,
+            'hedgesG': 0.0,
+            'effectSize': 'negligible',
+            'isSignificant': False,
+            'significanceMarker': 'ns',
+        }
+
+    t_stat = (mean_a - mean_b) / se_diff
+
+    # Welch–Satterthwaite degrees of freedom
+    denom = 0.0
+    if n_a > 1 and se_a > 0:
+        denom += (se_a ** 2) / float(n_a - 1)
+    if n_b > 1 and se_b > 0:
+        denom += (se_b ** 2) / float(n_b - 1)
+
+    df = ((se_a + se_b) ** 2) / denom if denom > 0 else float(n_a + n_b - 2)
+    df = max(1.0, df)
+
+    # Two-tailed p-value
+    cdf = _student_t_cdf(abs(t_stat), df)
+    p_val = round(2.0 * (1.0 - cdf), 4)
+
+    # Pooled standard deviation & Hedges' g
+    pooled_var = (((n_a - 1) * var_a) + ((n_b - 1) * var_b)) / float(n_a + n_b - 2)
+    s_pooled = math.sqrt(pooled_var) if pooled_var > 0 else 0.0
+
+    if s_pooled > 0:
+        cohen_d = (mean_a - mean_b) / s_pooled
+        # Small sample correction J
+        j_corr = 1.0 - (3.0 / (4.0 * (n_a + n_b) - 9.0))
+        hedges_g = round(cohen_d * j_corr, 3)
+    else:
+        hedges_g = 0.0
+
+    abs_g = abs(hedges_g)
+    if abs_g < 0.2:
+        eff_size = 'negligible'
+    elif abs_g < 0.5:
+        eff_size = 'small'
+    elif abs_g < 0.8:
+        eff_size = 'medium'
+    else:
+        eff_size = 'large'
+
+    is_sig = p_val < 0.05
+    if p_val < 0.001:
+        marker = '***'
+    elif p_val < 0.01:
+        marker = '**'
+    elif p_val < 0.05:
+        marker = '*'
+    else:
+        marker = 'ns'
+
+    return {
+        'tStatistic': round(t_stat, 3),
+        'degreesOfFreedom': round(df, 1),
+        'pValue': p_val,
+        'hedgesG': hedges_g,
+        'effectSize': eff_size,
+        'isSignificant': is_sig,
+        'significanceMarker': marker,
+    }
+
+
 def get_experimental_arm_analysis(survey):
     """
     Computes comparative analytics between experimental arms: gamified vs control.
+    Includes Welch's t-test, p-values, degrees of freedom, and Hedges' g effect sizes.
     """
+    detected_variants = set(
+        Response.objects.filter(survey=survey)
+        .exclude(variant__isnull=True)
+        .exclude(variant='')
+        .values_list('variant', flat=True)
+        .distinct()
+    )
+    arm_names = list(detected_variants) if detected_variants else ['gamified', 'control']
+    if 'control' not in arm_names:
+        arm_names.append('control')
+    if 'gamified' not in arm_names:
+        arm_names.append('gamified')
+
     arms = {}
-    for arm_name in ['gamified', 'control']:
+    for arm_name in arm_names:
         arm_responses = Response.objects.filter(survey=survey, variant=arm_name)
         count = arm_responses.count()
         scores, overall = get_hmsam_scores(survey, responses_qs=arm_responses)
@@ -323,20 +460,43 @@ def get_experimental_arm_analysis(survey):
             'reliabilities': reliabilities,
         }
 
-    # Difference (treatment effect): gamified - control
-    g_scores = arms['gamified']['constructScores']
-    c_scores = arms['control']['constructScores']
+    # Treatment effect: gamified - control
+    g_scores = arms.get('gamified', {}).get('constructScores', {})
+    c_scores = arms.get('control', {}).get('constructScores', {})
     diffs = {}
+    stats_comparison = {}
+
+    g_responses = list(Response.objects.filter(survey=survey, variant='gamified'))
+    c_responses = list(Response.objects.filter(survey=survey, variant='control'))
+
     for k in CONSTRUCT_ORDER:
         if k in g_scores and k in c_scores:
             g_val = g_scores[k].get('normalized_score', g_scores[k].get('score', 0))
             c_val = c_scores[k].get('normalized_score', c_scores[k].get('score', 0))
             diffs[k] = round(g_val - c_val, 2)
 
+            # Extract per-respondent means for construct k
+            c_qs = survey.questions.filter(hmsam_construct__iexact=k)
+            g_samples = []
+            for resp in g_responses:
+                ans_vals = list(Answer.objects.filter(response=resp, question__in=c_qs, likert_value__isnull=False).values_list('likert_value', flat=True))
+                if ans_vals:
+                    g_samples.append(sum(ans_vals) / float(len(ans_vals)))
+
+            c_samples = []
+            for resp in c_responses:
+                ans_vals = list(Answer.objects.filter(response=resp, question__in=c_qs, likert_value__isnull=False).values_list('likert_value', flat=True))
+                if ans_vals:
+                    c_samples.append(sum(ans_vals) / float(len(ans_vals)))
+
+            stats_comparison[k] = compute_welch_t_test(g_samples, c_samples)
+
     return {
         'arms': arms,
         'constructDifferences': diffs,
+        'statisticalComparison': stats_comparison,
     }
+
 
 
 # ── Response distribution ──────────────────────────────────

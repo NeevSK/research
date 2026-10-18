@@ -6,10 +6,14 @@ from django.middleware.csrf import get_token
 from django.contrib.auth import authenticate, login, logout, get_user_model
 from django.db import transaction
 from django.db.models import F, Sum
-from surveys.models import Survey, Response, Answer, Question, MCQOption
+from surveys.models import Survey, Response, Answer, Question, MCQOption, Experiment, Assignment
 from accounts.models import Organization, CreatorProfile, RespondentProfile
 from surveys.validation import validate_survey_submission
-from surveys.points import calculate_question_points
+from surveys.points import (
+    calculate_question_points,
+    calculate_variable_reward,
+    evaluate_negative_reinforcement,
+)
 
 User = get_user_model()
 
@@ -463,6 +467,68 @@ def api_surveys_list(request):
     return JsonResponse({'ok': True, 'surveys': items})
 
 
+def assign_participant_arm(survey, participant_id, requested_arm=None):
+    """
+    Deterministic Salted Experimental Arm Assignment Engine.
+    Uses salted cryptographic hashing: h = sha256(salt + participant_id) % total_weight.
+    Persists assignment to Assignment model for longitudinal participant consistency.
+    Supports researcher overrides via requested_arm for testing.
+    """
+    import hashlib
+    experiment, _ = Experiment.objects.get_or_create(
+        survey=survey,
+        key='hmsam-gamification-study',
+        defaults={
+            'salt': 'feedora_exp_salt_v1',
+            'arms': [
+                {'name': 'control', 'weight': 50},
+                {'name': 'gamified', 'weight': 50},
+            ],
+            'active': True,
+        }
+    )
+
+    if requested_arm in ('gamified', 'control', 'variable', 'fixed'):
+        assignment, _ = Assignment.objects.get_or_create(
+            experiment=experiment,
+            participant_id=participant_id,
+            defaults={'arm': requested_arm}
+        )
+        if assignment.arm != requested_arm:
+            assignment.arm = requested_arm
+            assignment.save(update_fields=['arm'])
+        return assignment.arm, experiment
+
+    existing = Assignment.objects.filter(experiment=experiment, participant_id=participant_id).first()
+    if existing:
+        return existing.arm, experiment
+
+    arms = experiment.arms or [
+        {'name': 'control', 'weight': 50},
+        {'name': 'gamified', 'weight': 50},
+    ]
+
+    total_weight = sum(a.get('weight', 0) for a in arms) or 100
+    salt = experiment.salt or 'feedora_exp_salt_v1'
+    digest = hashlib.sha256(f"{salt}:{participant_id}".encode('utf-8')).hexdigest()
+    slot = int(digest[:8], 16) % total_weight
+
+    cumulative = 0
+    assigned_arm = 'gamified'
+    for a in arms:
+        cumulative += a.get('weight', 0)
+        if slot < cumulative:
+            assigned_arm = a.get('name', 'gamified')
+            break
+
+    assignment = Assignment.objects.create(
+        experiment=experiment,
+        participant_id=participant_id,
+        arm=assigned_arm
+    )
+    return assignment.arm, experiment
+
+
 def _serialize_survey_meta(survey, request=None):
     questions = []
     for q in survey.questions.all().order_by('order'):
@@ -482,27 +548,49 @@ def _serialize_survey_meta(survey, request=None):
 
     csrf_token = get_token(request) if request else None
 
-    # Deterministic or requested experimental arm assignment (Task 3.2 / Defect 1)
-    variant = 'gamified'
+    # Deterministic or requested experimental arm assignment via salted hashing
+    participant_id = None
+    req_arm = None
     if request:
-        req_variant = request.GET.get('variant') or request.GET.get('arm')
-        if req_variant in ('gamified', 'control'):
-            variant = req_variant
+        req_arm = request.GET.get('variant') or request.GET.get('arm')
+        participant_id = (
+            request.GET.get('participant_id') or
+            request.GET.get('participantId') or
+            request.headers.get('X-Participant-ID')
+        )
+        if not participant_id and request.user.is_authenticated:
+            participant_id = request.user.email or str(request.user.id)
+        if not participant_id:
+            if hasattr(request, 'session') and request.session.session_key:
+                participant_id = f"sess_{request.session.session_key}"
+            else:
+                participant_id = f"client_{request.META.get('REMOTE_ADDR', 'anon')}"
+    else:
+        participant_id = 'default_participant'
+
+    variant, experiment_obj = assign_participant_arm(survey, participant_id, requested_arm=req_arm)
 
     resolved_features = json.loads(json.dumps(survey.features or {}))
     if variant == 'control':
-        for feat_key in ['points', 'mascot', 'badges', 'levels', 'leaderboard', 'rewards']:
+        for feat_key in ['points', 'mascot', 'badges', 'levels', 'leaderboard', 'rewards', 'negative_reinforcement']:
             if feat_key in resolved_features and isinstance(resolved_features[feat_key], dict):
                 resolved_features[feat_key]['enabled'] = False
             else:
                 resolved_features[feat_key] = {'enabled': False}
+    elif variant == 'variable':
+        if 'rewards' not in resolved_features or not isinstance(resolved_features['rewards'], dict):
+            resolved_features['rewards'] = {}
+        resolved_features['rewards']['enabled'] = True
+        resolved_features['rewards']['mode'] = 'variable'
 
     return {
         'ok': True,
         'csrfToken': csrf_token,
         'experiment': {
-            'experimentKey': 'hmsam-gamification-study',
+            'experimentKey': experiment_obj.key if experiment_obj else 'hmsam-gamification-study',
             'variant': variant,
+            'arm': variant,
+            'participantId': participant_id,
         },
         'survey': {
             'id': survey.id,
@@ -708,6 +796,20 @@ def api_survey_submit(request, access_uuid):
                 if variant == 'control':
                     total_points = 0
 
+                # Optional Variable Rewards bonus (Skinnerian Variable-Ratio)
+                variable_bonus, multiplier, bonus_label = 0, 1.0, None
+                if variant != 'control' and total_points > 0:
+                    variable_bonus, multiplier, bonus_label = calculate_variable_reward(total_points, survey.features)
+                    total_points += variable_bonus
+
+                # Optional Negative Reinforcement perks (Friction Removal & Streak Shielding)
+                responses_count = Response.objects.filter(survey=survey, user=user).count() + 1 if user else 1
+                nr_eval = evaluate_negative_reinforcement(
+                    survey.features,
+                    responses_count=responses_count,
+                    completed_clean=len(quality_flags) == 0
+                )
+
                 response_obj.points_earned = total_points
                 response_obj.save(update_fields=['points_earned'])
 
@@ -736,6 +838,9 @@ def api_survey_submit(request, access_uuid):
         'platform': platform,
         'qualityFlags': response_obj.quality_flags,
         'pointsEarned': total_points,
+        'variableBonus': variable_bonus,
+        'bonusLabel': bonus_label,
+        'negativeReinforcement': nr_eval,
         'surveyUuid': str(survey.access_uuid),
         'totalPoints': user_data['totalPoints'] if user_data else total_points,
         'user': user_data,

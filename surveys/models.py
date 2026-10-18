@@ -141,3 +141,28 @@ class Answer(models.Model):
     text_value      = models.TextField(blank=True)
     selected_option = models.ForeignKey(MCQOption, on_delete=models.SET_NULL,
                                         null=True, blank=True)
+
+
+class Experiment(models.Model):
+    survey = models.ForeignKey(Survey, on_delete=models.CASCADE, related_name='experiments')
+    key = models.CharField(max_length=100, default='hmsam-gamification-study')
+    arms = models.JSONField(default=list, blank=True)
+    salt = models.CharField(max_length=64, default='feedora_exp_salt_v1')
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Experiment {self.key} for {self.survey.title}"
+
+
+class Assignment(models.Model):
+    experiment = models.ForeignKey(Experiment, on_delete=models.CASCADE, related_name='assignments')
+    participant_id = models.CharField(max_length=128, db_index=True)
+    arm = models.CharField(max_length=64)
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('experiment', 'participant_id')
+
+    def __str__(self):
+        return f"{self.participant_id} -> {self.arm} ({self.experiment.key})"

@@ -431,3 +431,112 @@ class Phase1DataIntegrityTests(TestCase):
         self.assertIn('Pseudonym ID', content)
         self.assertIn('Variant / Arm', content)
         self.assertIn('Quality Flags', content)
+
+    def test_deterministic_salted_arm_assignment(self):
+        """Participant IDs are hashed deterministically and persisted in Assignment model."""
+        from surveys.models import Experiment, Assignment
+        from feedora_project.api_views import assign_participant_arm
+
+        # Two distinct participants
+        p1 = 'participant_alpha@research.edu'
+        p2 = 'participant_beta@research.edu'
+
+        arm1, exp1 = assign_participant_arm(self.survey, p1)
+        arm2, exp2 = assign_participant_arm(self.survey, p2)
+
+        self.assertIn(arm1, ('control', 'gamified'))
+        self.assertIn(arm2, ('control', 'gamified'))
+
+        # Idempotent second call returns same arm
+        arm1_repeat, _ = assign_participant_arm(self.survey, p1)
+        self.assertEqual(arm1, arm1_repeat)
+
+        # Assignment persisted in DB
+        self.assertTrue(Assignment.objects.filter(experiment=exp1, participant_id=p1, arm=arm1).exists())
+
+        # Metadata endpoint with participant_id returns deterministic arm
+        meta_res = self.client.get(f'/api/v1/surveys/{self.survey.access_uuid}/meta/?participant_id={p1}')
+        self.assertEqual(meta_res.status_code, 200)
+        meta_data = meta_res.json()
+        self.assertEqual(meta_data['experiment']['variant'], arm1)
+        self.assertEqual(meta_data['experiment']['arm'], arm1)
+
+    def test_variable_rewards_and_negative_reinforcement_submission(self):
+        """Survey with optional variable rewards and negative reinforcement evaluates bonuses and perks."""
+        self.survey.features = {
+            'points': {'enabled': True, 'values': {'likert': 20}},
+            'rewards': {
+                'enabled': True,
+                'mode': 'variable',
+                'probability': 1.0,  # 100% chance for test determinism
+                'minMultiplier': 1.5,
+                'maxMultiplier': 1.5,
+            },
+            'negative_reinforcement': {
+                'enabled': True,
+                'friction_removal': True,
+                'streak_shield': True,
+            }
+        }
+        self.survey.save()
+
+        url = f'/api/v1/surveys/{self.survey.access_uuid}/submit/'
+        res = self.client.post(url, data=json.dumps({
+            'submissionId': str(uuid.uuid4()),
+            'variant': 'gamified',
+            'answers': {'JOY1': 5},
+        }), content_type='application/json')
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertTrue(data['ok'])
+        # Base 20 pts + 1.5x multiplier -> 10 pts variable bonus -> 30 total
+        self.assertEqual(data['pointsEarned'], 30)
+        self.assertEqual(data['variableBonus'], 10)
+        self.assertIn('Lucky Voice Boost', data['bonusLabel'])
+        self.assertTrue(data['negativeReinforcement']['enabled'])
+        self.assertTrue(data['negativeReinforcement']['friction_removed'])
+        self.assertTrue(data['negativeReinforcement']['streak_shielded'])
+
+    def test_statistical_significance_welch_t_and_hedges_g(self):
+        """Arm analysis computes Welch's t-test, p-value, and Hedges' g between arms."""
+        q_joy2 = Question.objects.create(
+            survey=self.survey,
+            code='JOY2_STAT',
+            text='Using this tool is delightful',
+            question_type='likert',
+            hmsam_construct='joy',
+            rating_max=5,
+            order=4,
+        )
+        self.q_likert.hmsam_construct = 'joy'
+        self.q_likert.save()
+
+        # Submit 2 gamified responses (high scores)
+        url = f'/api/v1/surveys/{self.survey.access_uuid}/submit/'
+        for val in [5, 5]:
+            self.client.post(url, data=json.dumps({
+                'submissionId': str(uuid.uuid4()),
+                'variant': 'gamified',
+                'answers': {'JOY1': val, 'JOY2_STAT': val},
+            }), content_type='application/json')
+
+        # Submit 2 control responses (low scores)
+        for val in [1, 2]:
+            self.client.post(url, data=json.dumps({
+                'submissionId': str(uuid.uuid4()),
+                'variant': 'control',
+                'answers': {'JOY1': val, 'JOY2_STAT': val},
+            }), content_type='application/json')
+
+        analysis_url = f'/api/v1/surveys/{self.survey.access_uuid}/analysis/'
+        res = self.client.get(analysis_url)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn('statisticalComparison', data['experimentalComparison'])
+        joy_stat = data['experimentalComparison']['statisticalComparison'].get('joy')
+        self.assertIsNotNone(joy_stat)
+        self.assertIsNotNone(joy_stat['tStatistic'])
+        self.assertIsNotNone(joy_stat['pValue'])
+        self.assertIsNotNone(joy_stat['hedgesG'])
+        self.assertIn(joy_stat['effectSize'], ('large', 'medium', 'small', 'negligible'))
+
