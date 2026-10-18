@@ -128,4 +128,76 @@ def validate_survey_submission(survey: Survey, answers: Any, strict_required: bo
                     })
                     break
 
+        # Short and open verbatim text question validation & quality analysis
+        elif question.question_type in ('short', 'open'):
+            text_str = str(val).replace('\x00', '')
+
+            # Enforce non-empty whitespace when item is required
+            if enforce_required and not text_str.strip():
+                errors.append({
+                    'code': q_code,
+                    'reason': f"Text response for '{q_code}' cannot be empty."
+                })
+                continue
+
+            # Configurable strict length boundary (default allows safe truncation up to 10k)
+            val_cfg = survey.features.get('validation', {})
+            max_len = val_cfg.get('max_text_length', 10000)
+            if val_cfg.get('strict_length', False) and len(text_str) > max_len:
+                errors.append({
+                    'code': q_code,
+                    'reason': f"Text for '{q_code}' exceeds maximum length of {max_len} characters."
+                })
+                continue
+
+            # Minimum length check for research feedback if configured
+            min_len = val_cfg.get('min_open_length', 0)
+            if min_len > 0 and len(text_str.strip()) < min_len:
+                errors.append({
+                    'code': q_code,
+                    'reason': f"Response for '{q_code}' must contain at least {min_len} characters."
+                })
+                continue
+
     return len(errors) == 0, errors
+
+
+def analyze_text_quality(text: str, question: Question = None) -> Dict[str, Any]:
+    """
+    Granular NLP / quality analysis for verbatim answers.
+    Evaluates depth, repetition, sentiment hints, and construct alignment
+    for downstream analysis and LLM summarization.
+    """
+    cleaned = str(text or '').strip()
+    words = cleaned.split()
+    word_count = len(words)
+    char_count = len(cleaned)
+
+    # Detect repetition or keyboard spam (e.g. 'aaaaa', 'asdfasdf', high char concentration)
+    is_spam = False
+    if char_count >= 8:
+        unique_chars = len(set(cleaned.lower()))
+        if unique_chars <= 3 or (char_count / max(1, unique_chars)) > 4.0:
+            is_spam = True
+
+    # Hedonic / HMSAM construct keywords dictionary for automated qualitative tagging
+    construct_keywords = {
+        'joy': ['fun', 'enjoy', 'happy', 'pleasure', 'entertaining', 'delight', 'exciting'],
+        'peou': ['easy', 'simple', 'clear', 'effortless', 'intuitive', 'straightforward', 'hard', 'difficult'],
+        'pu': ['useful', 'effective', 'helpful', 'valuable', 'productive', 'efficient', 'useless'],
+        'curiosity': ['curious', 'explore', 'discover', 'learn', 'interesting', 'intriguing'],
+    }
+
+    lowered = cleaned.lower()
+    matched_constructs = [
+        c for c, kws in construct_keywords.items()
+        if any(kw in lowered for kw in kws)
+    ]
+
+    return {
+        'word_count': word_count,
+        'char_count': char_count,
+        'is_spam': is_spam,
+        'matched_constructs': matched_constructs,
+        'llm_ready': word_count >= 3 and not is_spam,
+    }
