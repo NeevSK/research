@@ -482,9 +482,28 @@ def _serialize_survey_meta(survey, request=None):
 
     csrf_token = get_token(request) if request else None
 
+    # Deterministic or requested experimental arm assignment (Task 3.2 / Defect 1)
+    variant = 'gamified'
+    if request:
+        req_variant = request.GET.get('variant') or request.GET.get('arm')
+        if req_variant in ('gamified', 'control'):
+            variant = req_variant
+
+    resolved_features = json.loads(json.dumps(survey.features or {}))
+    if variant == 'control':
+        for feat_key in ['points', 'mascot', 'badges', 'levels', 'leaderboard', 'rewards']:
+            if feat_key in resolved_features and isinstance(resolved_features[feat_key], dict):
+                resolved_features[feat_key]['enabled'] = False
+            else:
+                resolved_features[feat_key] = {'enabled': False}
+
     return {
         'ok': True,
         'csrfToken': csrf_token,
+        'experiment': {
+            'experimentKey': 'hmsam-gamification-study',
+            'variant': variant,
+        },
         'survey': {
             'id': survey.id,
             'uuid': str(survey.access_uuid),
@@ -500,7 +519,7 @@ def _serialize_survey_meta(survey, request=None):
             'qFont': survey.q_font,
             'headerFont': survey.header_font,
         },
-        'features': survey.features or {},
+        'features': resolved_features,
         'questions': questions,
     }
 
@@ -583,6 +602,17 @@ def api_survey_submit(request, access_uuid):
     import time
     import random
     from django.db import OperationalError
+    from django.utils import timezone
+
+    variant = payload.get('variant') or 'gamified'
+    experiment_key = payload.get('experimentKey') or payload.get('experiment_key') or 'hmsam-gamification-study'
+    platform = payload.get('platform') or ('mobile' if 'mobile' in request.headers.get('User-Agent', '').lower() else 'web')
+    app_version = payload.get('appVersion') or payload.get('app_version') or '1.0.0'
+    duration_ms = payload.get('durationMs') or payload.get('duration_ms')
+    dwell_ms = payload.get('dwellMs') or payload.get('dwell_ms') or {}
+    quality_flags = payload.get('qualityFlags') or payload.get('quality_flags') or []
+    consent_version = payload.get('consentVersion') or payload.get('consent_version') or '1.0'
+    consented_at = timezone.now() if consent_version else None
 
     response_obj = None
     total_points = 0
@@ -595,6 +625,15 @@ def api_survey_submit(request, access_uuid):
                     survey=survey,
                     user=user,
                     submission_id=submission_id,
+                    variant=variant,
+                    experiment_key=experiment_key,
+                    platform=platform,
+                    app_version=app_version,
+                    duration_ms=duration_ms,
+                    dwell_ms=dwell_ms if isinstance(dwell_ms, dict) else {},
+                    quality_flags=quality_flags if isinstance(quality_flags, list) else [str(quality_flags)],
+                    consent_version=consent_version,
+                    consented_at=consented_at,
                     points_earned=0
                 )
                 total_points = 0
@@ -666,6 +705,9 @@ def api_survey_submit(request, access_uuid):
                         if opt_count > 0:
                             total_points += calculate_question_points('checkbox', survey.features)
 
+                if variant == 'control':
+                    total_points = 0
+
                 response_obj.points_earned = total_points
                 response_obj.save(update_fields=['points_earned'])
 
@@ -689,6 +731,10 @@ def api_survey_submit(request, access_uuid):
         'ok': True,
         'responseId': response_obj.id,
         'submissionId': submission_id,
+        'variant': variant,
+        'arm': variant,
+        'platform': platform,
+        'qualityFlags': response_obj.quality_flags,
         'pointsEarned': total_points,
         'surveyUuid': str(survey.access_uuid),
         'totalPoints': user_data['totalPoints'] if user_data else total_points,
@@ -970,3 +1016,65 @@ def api_swagger_docs(request):
 </html>
 """
     return HttpResponse(html, content_type='text/html')
+
+
+@require_GET
+def api_survey_analysis(request, access_uuid):
+    """
+    Server-side analysis API (Phase 4 / Defect 6 & Task 4.3):
+    Returns per-construct scores, Cronbach's alpha per construct,
+    and comparative statistics between experimental arms (gamified vs control).
+    """
+    try:
+        survey = Survey.objects.get(access_uuid=access_uuid, is_active=True)
+    except Survey.DoesNotExist:
+        return JsonResponse({'ok': False, 'error': 'Survey not found'}, status=404)
+
+    from surveys.analytics import (
+        get_hmsam_scores,
+        cronbach_alpha,
+        get_hmsam_construct_reliabilities,
+        get_experimental_arm_analysis,
+    )
+
+    total_responses = Response.objects.filter(survey=survey).count()
+    overall_scores, overall_adoption = get_hmsam_scores(survey)
+    overall_alpha, alpha_interp = cronbach_alpha(survey)
+    construct_alphas = get_hmsam_construct_reliabilities(survey)
+    arm_analysis = get_experimental_arm_analysis(survey)
+
+    return JsonResponse({
+        'ok': True,
+        'survey': {
+            'id': survey.id,
+            'uuid': str(survey.access_uuid),
+            'title': survey.title,
+            'isHmsam': survey.is_hmsam,
+        },
+        'totalResponses': total_responses,
+        'overallAdoption': overall_adoption,
+        'overallAlpha': {
+            'value': overall_alpha,
+            'interpretation': alpha_interp,
+        },
+        'constructScores': overall_scores,
+        'constructReliabilities': construct_alphas,
+        'experimentalComparison': arm_analysis,
+    })
+
+
+@require_GET
+def api_survey_export(request, access_uuid):
+    """
+    Download research dataset formatted for SmartPLS / R seminr with pseudonymous respondent IDs.
+    """
+    try:
+        survey = Survey.objects.get(access_uuid=access_uuid, is_active=True)
+    except Survey.DoesNotExist:
+        return JsonResponse({'ok': False, 'error': 'Survey not found'}, status=404)
+
+    from surveys.analytics import csv_export
+    csv_data = csv_export(survey, pseudonymize=True)
+    response = HttpResponse(csv_data, content_type='text/csv; charset=utf-8')
+    response['Content-Disposition'] = f'attachment; filename="hmsam_survey_{access_uuid}_export.csv"'
+    return response

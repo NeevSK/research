@@ -355,3 +355,79 @@ class Phase1DataIntegrityTests(TestCase):
         self.assertEqual(scores['joy']['normalized_score'], 100.0)
         self.assertEqual(scores['joy']['scale_max'], 7)
         self.assertEqual(scores['joy']['mean'], 7.0)
+
+    def test_experimental_arm_variant_and_telemetry_recording(self):
+        """Submitting with experimental arm 'control' records variant and withholds gamified points."""
+        url = f'/api/v1/surveys/{self.survey.access_uuid}/submit/'
+        payload = {
+            'submissionId': str(uuid.uuid4()),
+            'variant': 'control',
+            'platform': 'mobile',
+            'durationMs': 42000,
+            'qualityFlags': ['SPEEDER'],
+            'consentVersion': '1.0',
+            'answers': {'JOY1': 5},
+        }
+        res = self.client.post(url, data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data['variant'], 'control')
+        self.assertEqual(data['pointsEarned'], 0)  # Control arm receives 0 points
+
+        resp_obj = Response.objects.get(submission_id=payload['submissionId'])
+        self.assertEqual(resp_obj.variant, 'control')
+        self.assertEqual(resp_obj.platform, 'mobile')
+        self.assertEqual(resp_obj.duration_ms, 42000)
+        self.assertEqual(resp_obj.quality_flags, ['SPEEDER'])
+        self.assertEqual(resp_obj.consent_version, '1.0')
+
+    def test_server_side_analysis_api_and_csv_export(self):
+        """Analysis API returns per-construct scores and arm comparisons; export endpoint returns CSV."""
+        # Create second question to support construct reliability
+        q_joy2 = Question.objects.create(
+            survey=self.survey,
+            code='JOY2',
+            text='Using this tool is fascinating',
+            question_type='likert',
+            hmsam_construct='joy',
+            rating_max=5,
+            order=3,
+        )
+        self.q_likert.hmsam_construct = 'joy'
+        self.q_likert.save()
+
+        # Submit gamified response
+        url = f'/api/v1/surveys/{self.survey.access_uuid}/submit/'
+        self.client.post(url, data=json.dumps({
+            'submissionId': str(uuid.uuid4()),
+            'variant': 'gamified',
+            'answers': {'JOY1': 5, 'JOY2': 5},
+        }), content_type='application/json')
+
+        # Submit control response
+        self.client.post(url, data=json.dumps({
+            'submissionId': str(uuid.uuid4()),
+            'variant': 'control',
+            'answers': {'JOY1': 3, 'JOY2': 3},
+        }), content_type='application/json')
+
+        # Test analysis endpoint
+        analysis_url = f'/api/v1/surveys/{self.survey.access_uuid}/analysis/'
+        analysis_res = self.client.get(analysis_url)
+        self.assertEqual(analysis_res.status_code, 200)
+        adata = analysis_res.json()
+        self.assertTrue(adata['ok'])
+        self.assertEqual(adata['totalResponses'], 2)
+        self.assertIn('arms', adata['experimentalComparison'])
+        self.assertEqual(adata['experimentalComparison']['arms']['gamified']['count'], 1)
+        self.assertEqual(adata['experimentalComparison']['arms']['control']['count'], 1)
+
+        # Test CSV export endpoint
+        export_url = f'/api/v1/surveys/{self.survey.access_uuid}/export.csv'
+        export_res = self.client.get(export_url)
+        self.assertEqual(export_res.status_code, 200)
+        self.assertIn('text/csv', export_res['Content-Type'])
+        content = export_res.content.decode('utf-8')
+        self.assertIn('Pseudonym ID', content)
+        self.assertIn('Variant / Arm', content)
+        self.assertIn('Quality Flags', content)

@@ -88,7 +88,7 @@ def get_overall_interpretation(score):
 
 
 # ── HMSAM construct scores ─────────────────────────────────
-def get_hmsam_scores(survey):
+def get_hmsam_scores(survey, responses_qs=None):
     """
     Calculates HMSAM construct scores using the paper formula:
     Score = (weighted_sum / (max_scale × n)) × 100
@@ -106,10 +106,14 @@ def get_hmsam_scores(survey):
         if not qs.exists():
             continue
 
-        answers = Answer.objects.filter(
+        ans_query = Answer.objects.filter(
             question__in=qs,
             likert_value__isnull=False,
-        ).values_list('likert_value', flat=True)
+        )
+        if responses_qs is not None:
+            ans_query = ans_query.filter(response__in=responses_qs)
+
+        answers = ans_query.values_list('likert_value', flat=True)
 
         if not answers:
             continue
@@ -241,6 +245,98 @@ def cronbach_alpha(survey):
         interp = 'Negative reliability — check reverse-coded or inconsistent items'
  
     return alpha, interp
+
+
+# ── Per-construct Cronbach's Alpha (multidimensional reliability) ────
+def get_hmsam_construct_reliabilities(survey, variant=None):
+    """
+    Computes Cronbach's alpha per individual HMSAM construct dimension.
+    Optionally filters by experimental arm variant ('gamified' or 'control').
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return {}
+
+    responses_qs = Response.objects.filter(survey=survey)
+    if variant:
+        responses_qs = responses_qs.filter(variant=variant)
+    responses = list(responses_qs)
+    if len(responses) < 2:
+        return {}
+
+    results = {}
+    for code, label in CONSTRUCT_LABELS.items():
+        c_questions = list(survey.questions.filter(
+            hmsam_construct__iexact=code,
+            question_type__in=['likert', 'rating']
+        ).order_by('order'))
+        if len(c_questions) < 2:
+            continue
+
+        matrix = []
+        for resp in responses:
+            row = []
+            for q in c_questions:
+                ans = Answer.objects.filter(response=resp, question=q, likert_value__isnull=False).first()
+                if ans is not None:
+                    row.append(ans.likert_value)
+                else:
+                    row.append(None)
+            if None not in row:
+                matrix.append(row)
+
+        if len(matrix) >= 2:
+            arr = np.array(matrix, dtype=float)
+            k = arr.shape[1]
+            if k >= 2:
+                item_vars = arr.var(axis=0, ddof=1)
+                total_var = arr.sum(axis=1).var(ddof=1)
+                if total_var > 0:
+                    alpha = round(float((k / (k - 1)) * (1 - item_vars.sum() / total_var)), 3)
+                    alpha = max(-1.0, min(1.0, alpha))
+                    interp = 'High' if alpha >= 0.7 else ('Acceptable' if alpha >= 0.6 else 'Low')
+                    results[code] = {
+                        'label': label,
+                        'itemsCount': k,
+                        'sampleSize': len(matrix),
+                        'alpha': alpha,
+                        'interpretation': interp,
+                    }
+    return results
+
+
+def get_experimental_arm_analysis(survey):
+    """
+    Computes comparative analytics between experimental arms: gamified vs control.
+    """
+    arms = {}
+    for arm_name in ['gamified', 'control']:
+        arm_responses = Response.objects.filter(survey=survey, variant=arm_name)
+        count = arm_responses.count()
+        scores, overall = get_hmsam_scores(survey, responses_qs=arm_responses)
+        reliabilities = get_hmsam_construct_reliabilities(survey, variant=arm_name)
+        arms[arm_name] = {
+            'count': count,
+            'constructScores': scores,
+            'overallScore': overall,
+            'reliabilities': reliabilities,
+        }
+
+    # Difference (treatment effect): gamified - control
+    g_scores = arms['gamified']['constructScores']
+    c_scores = arms['control']['constructScores']
+    diffs = {}
+    for k in CONSTRUCT_ORDER:
+        if k in g_scores and k in c_scores:
+            g_val = g_scores[k].get('normalized_score', g_scores[k].get('score', 0))
+            c_val = c_scores[k].get('normalized_score', c_scores[k].get('score', 0))
+            diffs[k] = round(g_val - c_val, 2)
+
+    return {
+        'arms': arms,
+        'constructDifferences': diffs,
+    }
 
 
 # ── Response distribution ──────────────────────────────────
@@ -395,22 +491,43 @@ def get_respondent_answers(response_obj):
 
 
 # ── CSV export ─────────────────────────────────────────────
-def csv_export(survey):
-    """Returns CSV string of all responses."""
-    import csv, io
+def csv_export(survey, pseudonymize=True):
+    """
+    Returns CSV string of all responses with research variables:
+    pseudonymized ID, experimental arm (variant), platform, timings, quality flags, and consent.
+    """
+    import csv, io, hashlib
 
     questions = list(survey.questions.all().order_by('order'))
     output    = io.StringIO()
     writer    = csv.writer(output)
 
-    header = ['Response ID', 'Respondent', 'Points', 'Submitted At']
-    header += [f'Q{i+1}: {q.text[:40]}' for i, q in enumerate(questions)]
+    header = [
+        'Response ID', 'Pseudonym ID', 'Variant / Arm', 'Platform',
+        'Duration (ms)', 'Quality Flags', 'Consent Version', 'Points Earned', 'Completed At'
+    ]
+    header += [f'Q{i+1}_{q.code or q.hmsam_construct or "item"}: {q.text[:40]}' for i, q in enumerate(questions)]
     writer.writerow(header)
 
     for resp in Response.objects.filter(survey=survey).order_by('completed_at'):
-        respondent = resp.user.email if resp.user else 'Anonymous'
-        row = [resp.id, respondent, resp.points_earned,
-               resp.completed_at.strftime('%Y-%m-%d %H:%M')]
+        if resp.user:
+            raw_id = resp.user.email or str(resp.user.id)
+            pseudo_id = hashlib.sha256(f"feedora_salt_{raw_id}".encode()).hexdigest()[:12] if pseudonymize else raw_id
+        else:
+            pseudo_id = f"anon_{resp.id}"
+
+        flags_str = ";".join(resp.quality_flags) if isinstance(resp.quality_flags, list) else str(resp.quality_flags or '')
+        row = [
+            resp.id,
+            pseudo_id,
+            resp.variant or 'gamified',
+            resp.platform or 'web',
+            resp.duration_ms or '',
+            flags_str,
+            resp.consent_version or '1.0',
+            resp.points_earned,
+            resp.completed_at.strftime('%Y-%m-%d %H:%M:%S'),
+        ]
         for q in questions:
             ans = Answer.objects.filter(response=resp, question=q).first()
             if not ans:

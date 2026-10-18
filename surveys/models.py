@@ -115,13 +115,22 @@ class MCQOption(models.Model):
 
 
 class Response(models.Model):
-    survey        = models.ForeignKey(Survey, on_delete=models.CASCADE,
-                                      related_name='responses')
-    user          = models.ForeignKey(User, on_delete=models.SET_NULL,
-                                      null=True, blank=True)
-    submission_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
-    points_earned = models.PositiveIntegerField(default=0)
-    completed_at  = models.DateTimeField(auto_now_add=True)
+    survey          = models.ForeignKey(Survey, on_delete=models.CASCADE,
+                                        related_name='responses')
+    user            = models.ForeignKey(User, on_delete=models.SET_NULL,
+                                        null=True, blank=True)
+    submission_id   = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    variant         = models.CharField(max_length=50, blank=True, default='gamified')
+    experiment_key  = models.CharField(max_length=100, blank=True, default='hmsam-gamification-study')
+    platform        = models.CharField(max_length=20, blank=True, default='web')
+    app_version     = models.CharField(max_length=50, blank=True, default='1.0.0')
+    duration_ms     = models.PositiveIntegerField(null=True, blank=True)
+    dwell_ms        = models.JSONField(default=dict, blank=True)
+    quality_flags   = models.JSONField(default=list, blank=True)
+    consent_version = models.CharField(max_length=20, blank=True, default='1.0')
+    consented_at    = models.DateTimeField(null=True, blank=True)
+    points_earned   = models.PositiveIntegerField(default=0)
+    completed_at    = models.DateTimeField(auto_now_add=True)
 
 
 class Answer(models.Model):
