@@ -282,34 +282,10 @@ def submit_response(request, uid):
     survey = get_object_or_404(Survey, access_uuid=uid, is_active=True)
     user = request.user if request.user.is_authenticated else None
 
-    # ── Read custom point values from survey features ──
-    features       = survey.features or {}
-    points_config  = features.get('points', {})
-    points_enabled = points_config.get('enabled', False)
-    custom_values  = points_config.get('values', {})
-
-    # Default values — used if a type has no custom value set
-    DEFAULT_POINTS = {
-        'likert':   10,
-        'rating':   10,
-        'mcq':      10,
-        'checkbox': 10,
-        'dropdown': 10,
-        'short':    10,
-        'open':     20,
-        'date':     5,
-        'file':     15,
-    }
+    from .points import calculate_question_points
 
     def pts(qtype, answer_text=''):
-        """Return points for a question type, honouring the creator's custom values."""
-        if not points_enabled:
-            return 0
-        base = custom_values.get(qtype, DEFAULT_POINTS.get(qtype, 10))
-        # Detailed text answers (>20 chars) earn the 'open' value
-        if qtype in ('short', 'open') and len(answer_text) > 20:
-            base = custom_values.get('open', DEFAULT_POINTS['open'])
-        return base
+        return calculate_question_points(qtype, survey.features, answer_text)
 
     response_obj = Response.objects.create(survey=survey, user=user, points_earned=0)
     total_points = 0

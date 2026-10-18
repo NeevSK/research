@@ -119,6 +119,7 @@ class Response(models.Model):
                                       related_name='responses')
     user          = models.ForeignKey(User, on_delete=models.SET_NULL,
                                       null=True, blank=True)
+    submission_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     points_earned = models.PositiveIntegerField(default=0)
     completed_at  = models.DateTimeField(auto_now_add=True)
 

@@ -2,10 +2,14 @@ import json
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST, require_GET
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
+from django.middleware.csrf import get_token
 from django.contrib.auth import authenticate, login, logout, get_user_model
 from django.db import transaction
+from django.db.models import F, Sum
 from surveys.models import Survey, Response, Answer, Question, MCQOption
 from accounts.models import Organization, CreatorProfile, RespondentProfile
+from surveys.validation import validate_survey_submission
+from surveys.points import calculate_question_points
 
 User = get_user_model()
 
@@ -153,11 +157,12 @@ def api_register(request):
                 total_points=0,
             )
 
-    login(request, user)
+    login(request, user, backend='django.contrib.auth.backends.ModelBackend')
 
     return JsonResponse({
         'ok': True,
         'user': _serialize_user(user, persona=persona),
+        'csrfToken': get_token(request),
     }, status=201)
 
 
@@ -201,28 +206,35 @@ def api_login(request):
         # Creators and staff can also browse in respondent persona if desired
         pass
 
-    login(request, user)
+    login(request, user, backend='django.contrib.auth.backends.ModelBackend')
 
     return JsonResponse({
         'ok': True,
         'user': _serialize_user(user, persona=requested_persona),
+        'csrfToken': get_token(request),
     })
 
 
 @require_GET
 def api_me(request):
     """Return currently authenticated user profile or unauthenticated status."""
+    csrf_token = get_token(request)
     if not request.user.is_authenticated:
-        return JsonResponse({'ok': True, 'authenticated': False, 'user': None})
+        return JsonResponse({
+            'ok': True,
+            'authenticated': False,
+            'user': None,
+            'csrfToken': csrf_token,
+        })
 
     return JsonResponse({
         'ok': True,
         'authenticated': True,
         'user': _serialize_user(request.user),
+        'csrfToken': csrf_token,
     })
 
 
-@csrf_exempt
 @require_POST
 def api_logout(request):
     """Log out current session."""
@@ -304,7 +316,7 @@ def api_surveys_list(request):
     return JsonResponse({'ok': True, 'surveys': items})
 
 
-def _serialize_survey_meta(survey):
+def _serialize_survey_meta(survey, request=None):
     questions = []
     for q in survey.questions.all().order_by('order'):
         questions.append({
@@ -321,8 +333,11 @@ def _serialize_survey_meta(survey):
             'sectionNum': q.section_num,
         })
 
+    csrf_token = get_token(request) if request else None
+
     return {
         'ok': True,
+        'csrfToken': csrf_token,
         'survey': {
             'id': survey.id,
             'uuid': str(survey.access_uuid),
@@ -351,7 +366,7 @@ def api_survey_meta(request, access_uuid):
     except Survey.DoesNotExist:
         return JsonResponse({'ok': False, 'error': 'Survey not found'}, status=404)
 
-    return JsonResponse(_serialize_survey_meta(survey))
+    return JsonResponse(_serialize_survey_meta(survey, request=request))
 
 
 @require_GET
@@ -362,11 +377,9 @@ def api_survey_meta_by_code(request, access_code):
     except Survey.DoesNotExist:
         return JsonResponse({'ok': False, 'error': f'Survey with access code {access_code} not found'}, status=404)
 
-    return JsonResponse(_serialize_survey_meta(survey))
+    return JsonResponse(_serialize_survey_meta(survey, request=request))
 
 
-
-@csrf_exempt
 @require_POST
 def api_survey_submit(request, access_uuid):
     """Submit respondent survey answers via JSON API and award points."""
@@ -385,32 +398,40 @@ def api_survey_submit(request, access_uuid):
 
     raw_answers = payload.get('answers') or {}
     user = request.user if request.user.is_authenticated else None
+    submission_id = str(payload.get('submissionId') or payload.get('submission_id') or '').strip() or None
 
-    # Calculate points from survey features or defaults
-    features = survey.features or {}
-    points_config = features.get('points', {})
-    points_enabled = points_config.get('enabled', True)
-    custom_values = points_config.get('values', {})
+    # Idempotent re-entry check via client submissionId
+    if submission_id:
+        existing_resp = Response.objects.filter(submission_id=submission_id).first()
+        if existing_resp:
+            user_data = _serialize_user(user) if user else None
+            return JsonResponse({
+                'ok': True,
+                'idempotent': True,
+                'responseId': existing_resp.id,
+                'submissionId': str(submission_id),
+                'pointsEarned': existing_resp.points_earned,
+                'surveyUuid': str(survey.access_uuid),
+                'totalPoints': user_data['totalPoints'] if user_data else existing_resp.points_earned,
+                'user': user_data,
+            }, status=200)
 
-    DEFAULT_POINTS = {
-        'likert': 10,
-        'rating': 10,
-        'mcq': 10,
-        'checkbox': 10,
-        'dropdown': 10,
-        'short': 10,
-        'open': 20,
-        'date': 5,
-        'file': 15,
-    }
+    # Configurable duplicate submission guard for authenticated participants
+    allow_multi_submit = bool(survey.features.get('allow_multiple_submissions', False))
+    if not allow_multi_submit and user and Response.objects.filter(survey=survey, user=user).exists():
+        return JsonResponse({
+            'ok': False,
+            'error': 'User has already submitted a response to this survey'
+        }, status=409)
 
-    def calc_pts(qtype, answer_text=''):
-        if not points_enabled:
-            return 0
-        base = custom_values.get(qtype, DEFAULT_POINTS.get(qtype, 10))
-        if qtype in ('short', 'open') and len(answer_text) > 20:
-            base = custom_values.get('open', DEFAULT_POINTS['open'])
-        return base
+    # Validate submission invariants against survey definition
+    is_valid, validation_errors = validate_survey_submission(survey, raw_answers)
+    if not is_valid:
+        return JsonResponse({
+            'ok': False,
+            'error': 'Validation failed',
+            'errors': validation_errors,
+        }, status=400)
 
     import time
     import random
@@ -423,7 +444,12 @@ def api_survey_submit(request, access_uuid):
     for db_attempt in range(max_db_attempts):
         try:
             with transaction.atomic():
-                response_obj = Response.objects.create(survey=survey, user=user, points_earned=0)
+                response_obj = Response.objects.create(
+                    survey=survey,
+                    user=user,
+                    submission_id=submission_id,
+                    points_earned=0
+                )
                 total_points = 0
 
                 # Normalise raw_answers: can be dict { "questionId": val } or list [ { "questionId": ..., "val": ... } ]
@@ -432,7 +458,7 @@ def api_survey_submit(request, access_uuid):
                     answers_dict = raw_answers
                 elif isinstance(raw_answers, list):
                     for item in raw_answers:
-                        qid = item.get('questionId') or item.get('id')
+                        qid = item.get('questionId') or item.get('id') or item.get('code')
                         if qid is not None:
                             answers_dict[str(qid)] = item.get('val') if 'val' in item else item.get('value')
 
@@ -455,7 +481,7 @@ def api_survey_submit(request, access_uuid):
                         try:
                             num_val = int(val)
                             Answer.objects.create(response=response_obj, question=question, likert_value=num_val)
-                            total_points += calc_pts(question.question_type)
+                            total_points += calculate_question_points(question.question_type, survey.features)
                         except (ValueError, TypeError):
                             pass
                     elif question.question_type in ('short', 'open', 'date'):
@@ -464,7 +490,7 @@ def api_survey_submit(request, access_uuid):
                             if len(str_val) > 10000:
                                 str_val = str_val[:10000]
                             Answer.objects.create(response=response_obj, question=question, text_value=str_val)
-                            total_points += calc_pts(question.question_type, str_val)
+                            total_points += calculate_question_points(question.question_type, survey.features, str_val)
                     elif question.question_type in ('mcq', 'dropdown'):
                         opt_obj = None
                         try:
@@ -475,7 +501,7 @@ def api_survey_submit(request, access_uuid):
                             opt_obj = MCQOption.objects.filter(question=question, text__iexact=val.strip()).first()
                         if opt_obj:
                             Answer.objects.create(response=response_obj, question=question, selected_option=opt_obj)
-                            total_points += calc_pts(question.question_type)
+                            total_points += calculate_question_points(question.question_type, survey.features)
                     elif question.question_type == 'checkbox':
                         vals = val if isinstance(val, list) else [val]
                         opt_count = 0
@@ -491,19 +517,19 @@ def api_survey_submit(request, access_uuid):
                                 Answer.objects.create(response=response_obj, question=question, selected_option=opt)
                                 opt_count += 1
                         if opt_count > 0:
-                            total_points += calc_pts('checkbox')
+                            total_points += calculate_question_points('checkbox', survey.features)
 
                 response_obj.points_earned = total_points
                 response_obj.save(update_fields=['points_earned'])
 
+                # Increment respondent profile total points atomically via database F() expression
                 if user:
-                    try:
-                        profile, _ = RespondentProfile.objects.get_or_create(user=user)
-                        profile.total_points = (profile.total_points or 0) + total_points
-                        profile.surveys_completed = (profile.surveys_completed or 0) + 1
-                        profile.save(update_fields=['total_points', 'surveys_completed'])
-                    except Exception:
-                        pass
+                    profile, _ = RespondentProfile.objects.get_or_create(user=user)
+                    if total_points > 0:
+                        RespondentProfile.objects.filter(pk=profile.pk).update(
+                            total_points=F('total_points') + total_points
+                        )
+                        profile.refresh_from_db()
             break
         except OperationalError as db_err:
             if 'locked' in str(db_err).lower() and db_attempt < max_db_attempts - 1:
@@ -515,6 +541,7 @@ def api_survey_submit(request, access_uuid):
     return JsonResponse({
         'ok': True,
         'responseId': response_obj.id,
+        'submissionId': submission_id,
         'pointsEarned': total_points,
         'surveyUuid': str(survey.access_uuid),
         'totalPoints': user_data['totalPoints'] if user_data else total_points,
@@ -556,7 +583,6 @@ def api_creator_surveys(request):
     return JsonResponse({'ok': True, 'surveys': items})
 
 
-@csrf_exempt
 @require_POST
 def api_creator_create_survey(request):
     """Scaffold and publish or draft a new survey from mobile/web Studio."""
