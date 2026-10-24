@@ -215,6 +215,8 @@
   <form method="post" action="{% url 'submit_response' survey.access_uuid %}"
         id="surveyForm" novalidate enctype="multipart/form-data">
     {% csrf_token %}
+    <input type="hidden" name="submission_id" value="{{ submission_id }}">
+    <input type="hidden" name="policy_version" value="{{ policy_version }}">
 
     {% for question in questions %}
  

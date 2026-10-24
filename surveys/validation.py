@@ -20,6 +20,7 @@ def validate_survey_submission(survey: Survey, answers: Any, strict_required: bo
       4. If strict_required is True (or survey.is_hmsam is True), required items must be present.
     """
     errors: List[Dict[str, str]] = []
+    features = survey.features if isinstance(survey.features, dict) else {}
 
     # Normalise answers into a lookup dictionary
     normalized: Dict[str, Any] = {}
@@ -43,7 +44,7 @@ def validate_survey_submission(survey: Survey, answers: Any, strict_required: bo
     # Check whether strict requiredness is enforced
     enforce_required = (
         strict_required or 
-        bool(survey.features.get('validation', {}).get('strict_required', False))
+        bool(features.get('validation', {}).get('strict_required', False))
     )
 
     questions = survey.questions.all().order_by('order')
@@ -77,10 +78,10 @@ def validate_survey_submission(survey: Survey, answers: Any, strict_required: bo
                 num_val = int(val)
                 min_val = getattr(question, 'rating_min', None)
                 if min_val is None:
-                    min_val = survey.features.get('rating_scale', {}).get('min', 1)
+                    min_val = features.get('rating_scale', {}).get('min', 1)
                 max_val = getattr(question, 'rating_max', None)
                 if max_val is None:
-                    max_val = survey.features.get('rating_scale', {}).get('max', 5)
+                    max_val = features.get('rating_scale', {}).get('max', 5)
 
                 if num_val < min_val or num_val > max_val:
                     errors.append({
@@ -141,7 +142,7 @@ def validate_survey_submission(survey: Survey, answers: Any, strict_required: bo
                 continue
 
             # Configurable strict length boundary (default allows safe truncation up to 10k)
-            val_cfg = survey.features.get('validation', {})
+            val_cfg = features.get('validation', {})
             max_len = val_cfg.get('max_text_length', 10000)
             if val_cfg.get('strict_length', False) and len(text_str) > max_len:
                 errors.append({

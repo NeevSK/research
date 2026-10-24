@@ -3,7 +3,7 @@ name = "gihini-research"
 version = "0.1.0"
 description = "Gihini University Research & Survey Service"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "asgiref==3.11.1",
     "certifi==2026.4.22",
@@ -22,6 +22,9 @@ dependencies = [
     "tzdata==2026.2",
     "urllib3==2.6.3",
 ]
+
+[project.optional-dependencies]
+mysql = ["mysqlclient==2.3.0"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

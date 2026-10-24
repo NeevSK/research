@@ -1,5 +1,9 @@
 import json
 import json as json_lib
+import hashlib
+import secrets
+import time
+import uuid
 from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse, HttpResponse
@@ -7,10 +11,95 @@ from django.views.decorators.http import require_POST, require_GET
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from .models import Survey, Question, MCQOption, Response, Answer
 from .hmsam import HMSAM_QUESTIONS
-from django.db import transaction
+from django.db import transaction, OperationalError
+from django.db.models import Q
 from django.core.mail import send_mail
-from accounts.models import RespondentProfile
+from accounts.models import OrganizationMembership, RespondentProfile
 from accounts.utils import get_level_info
+
+
+_POLICY_FEATURE_KEYS = frozenset({
+    'accessPolicy', 'access_policy', 'accessCodeRequired', 'access_code_required',
+    'requiresAccount', 'requires_account', 'organizationMembershipRequired',
+    'organization_membership_required', 'allowRedo', 'allow_redo',
+    'allow_multiple_submissions', 'maxAttempts', 'max_attempts',
+    'cooldownMinutes', 'cooldown_minutes', 'rewardStrategy', 'reward_strategy',
+    'prerequisites', 'prerequisiteSurveyIds', 'prerequisite_survey_ids',
+    'unlockDelayMs', 'sequence', 'sequenceGroup', 'sequence_group',
+    'sequenceOrder', 'sequence_order', 'enforceSequence', 'minScorePercent',
+    'min_score_percent', 'minimumScore', 'minimum_score', 'minimumScorePercent',
+    'minimum_score_percent', 'scoreThreshold', 'score_threshold',
+})
+
+
+def _policy_feature_projection(features):
+    projection = {key: features[key] for key in _POLICY_FEATURE_KEYS if key in features}
+    collection = features.get('collection')
+    if isinstance(collection, dict) and 'allow_multiple_submissions' in collection:
+        projection['collection.allow_multiple_submissions'] = collection['allow_multiple_submissions']
+    return projection
+
+
+def _ensure_web_guest_principal(request):
+    """Give public browser participation the same stable principal as Expo guests."""
+    if request.user.is_authenticated:
+        return None
+    from accounts.models import GuestPrincipal
+
+    from feedora_project.api_views import _guest_from_request
+    guest = _guest_from_request(request)
+    if request.headers.get('X-Feedora-Guest-Token', '').strip():
+        return guest if guest and not guest.claimed_by_id else None
+    if guest and not guest.claimed_by_id:
+        request.session['feedora_guest_principal_id'] = str(guest.pk)
+        return guest
+    raw_token = secrets.token_urlsafe(32)
+    guest = GuestPrincipal.objects.create(token_hash=hashlib.sha256(raw_token.encode('utf-8')).hexdigest())
+    request.session['feedora_guest_principal_id'] = str(guest.pk)
+    return guest
+
+
+def _respondent_policy_denial(request, survey):
+    """Use the same server policy decision for HTML, metadata, and API respondents."""
+    from feedora_project.api_views import (
+        _can_manage_survey, _eligibility_denial, _evaluate_survey_eligibility, _guest_from_request,
+        _has_survey_admission_grant, _policy_has_unsupported_score_rule, _requires_access_code,
+    )
+
+    if request.user.is_authenticated and _can_manage_survey(request.user, survey):
+        return None
+    if not request.user.is_authenticated:
+        guest = _guest_from_request(request)
+        if not guest:
+            return JsonResponse({'ok': False, 'code': 'guest_session_required', 'error': 'Start a guest session or sign in to continue.'}, status=401)
+        if guest.claimed_by_id:
+            return JsonResponse({'ok': False, 'code': 'guest_session_claimed', 'error': 'Sign in to continue with this guest session.'}, status=409)
+    if _policy_has_unsupported_score_rule(survey):
+        return JsonResponse({'ok': False, 'code': 'unsupported_policy', 'error': 'This survey has a rule the service cannot safely evaluate.'}, status=409)
+    if _requires_access_code(survey) and not _has_survey_admission_grant(request, survey):
+        response = JsonResponse({'ok': False, 'code': 'access_code_required', 'error': 'Verify the survey access code to continue.'}, status=403)
+        response['Cache-Control'] = 'private, no-store'
+        return response
+    decision, _ = _evaluate_survey_eligibility(request, survey)
+    denial = _eligibility_denial(decision)
+    if denial:
+        denial['Cache-Control'] = 'private, no-store'
+    return denial
+
+
+def _manageable_organizations(user):
+    return OrganizationMembership.objects.filter(
+        user=user,
+        role__in=OrganizationMembership.SURVEY_MANAGER_ROLES,
+        status=OrganizationMembership.ACTIVE,
+    ).select_related('organization')
+
+
+def _manageable_surveys(user):
+    managed_scope_ids = _manageable_organizations(user).values_list('organization_id', flat=True)
+    return Survey.objects.filter(
+        Q(created_by=user) | Q(organization_scope_id__in=managed_scope_ids),
+    ).distinct()
 
 
 @login_required
@@ -25,8 +114,22 @@ def create_survey(request, survey_type):
         data   = json.loads(request.body)
         action = data.get('action', 'publish')  # 'draft' or 'publish'
 
+        requested_org = data.get('organization_id') or request.GET.get('organization_id')
+        if requested_org:
+            membership = _manageable_organizations(request.user).filter(organization_id=requested_org).first()
+            if not membership:
+                return JsonResponse({'code': 'organization_forbidden', 'error': 'Choose an organization where you are an active owner or admin.'}, status=403)
+            organization_scope = membership.organization
+        else:
+            manageable = list(_manageable_organizations(request.user)[:2])
+            if len(manageable) != 1:
+                return JsonResponse({'code': 'organization_required', 'error': 'Choose an organization before saving this survey.'}, status=400)
+            organization_scope = manageable[0].organization
+
         survey = Survey.objects.create(
-            organization=request.user,
+            created_by=request.user,
+            organization_scope=organization_scope,
+            scope_kind='organization',
             title=data.get('title', 'Untitled Survey'),
             description=data.get('description', ''),
             is_hmsam=is_hmsam,
@@ -74,23 +177,30 @@ def create_survey(request, survey_type):
         for construct, code, text in HMSAM_QUESTIONS
     ]) if is_hmsam else '[]'
 
+    owned = _manageable_organizations(request.user)
+    selected_org_id = request.GET.get('organization_id')
+    if not selected_org_id:
+        first_two = list(owned[:2])
+        selected_org_id = str(first_two[0].organization_id) if len(first_two) == 1 else ''
     return render(request, 'surveys/survey_builder.html', {
         'is_hmsam': is_hmsam,
         'survey_type': survey_type,
         'hmsam_questions_json': hmsam_questions_json,
+        'owned_organizations': owned,
+        'selected_org_id': selected_org_id,
     })
 
 
 
 @login_required
 def my_surveys(request):
-    surveys = Survey.objects.filter(organization=request.user).order_by('-created_at')
+    surveys = _manageable_surveys(request.user).order_by('-created_at')
     return render(request, 'surveys/my_surveys.html', {'surveys': surveys})
 
 
 @login_required
 def survey_dashboard(request, uid):
-    survey         = get_object_or_404(Survey, access_uuid=uid, organization=request.user)
+    survey         = get_object_or_404(_manageable_surveys(request.user), access_uuid=uid)
     responses      = Response.objects.filter(survey=survey).order_by('-completed_at')
     response_count = responses.count()
  
@@ -197,7 +307,7 @@ def survey_dashboard(request, uid):
 
 @login_required
 def export_csv(request, uid):
-    survey = get_object_or_404(Survey, access_uuid=uid, organization=request.user)
+    survey = get_object_or_404(_manageable_surveys(request.user), access_uuid=uid)
     try:
         from .analytics import csv_export
         csv_data = csv_export(survey)
@@ -217,17 +327,36 @@ def survey_preview(request):
 
 def access_survey(request):
     error, submitted_code = None, ''
+    _ensure_web_guest_principal(request)
     if request.method == 'POST':
         code = request.POST.get('code', '').strip().upper()
         submitted_code = code
         if not code:
             error = 'Please enter an access code.'
         else:
-            try:
-                survey = Survey.objects.get(access_code=code, is_active=True)
-                return redirect('respond_survey', uid=survey.access_uuid)
-            except Survey.DoesNotExist:
-                error = 'Invalid code. Please check and try again.'
+            from feedora_project.api_views import (
+                _consume_access_code_attempt, _issue_survey_admission_grant,
+                _requires_access_code,
+            )
+            if not _consume_access_code_attempt(request):
+                error = 'The access code could not be verified. Please try again later.'
+            else:
+                survey = Survey.objects.filter(access_code=code, is_active=True, scope_review_required=False).first()
+                if not survey:
+                    error = 'The access code could not be verified.'
+                else:
+                    if _requires_access_code(survey):
+                        grant = _issue_survey_admission_grant(request, survey)
+                        if not grant:
+                            error = 'The access code could not be verified.'
+                        else:
+                            grants = request.session.get('feedora_survey_admission_grants', {})
+                            if not isinstance(grants, dict):
+                                grants = {}
+                            grants[str(survey.access_uuid)] = grant
+                            request.session['feedora_survey_admission_grants'] = grants
+                    if not error:
+                        return redirect('respond_survey', uid=survey.access_uuid)
     return render(request, 'surveys/access.html', {'error': error, 'submitted_code': submitted_code})
 
 
@@ -242,7 +371,12 @@ def respond_survey_meta(request, uid):
     ``ensure_csrf_cookie`` makes this the one GET a client needs to call first
     to receive (and then echo back on submit) a CSRF token.
     """
-    survey = get_object_or_404(Survey, access_uuid=uid, is_active=True)
+    survey = get_object_or_404(Survey, access_uuid=uid, is_active=True, scope_review_required=False)
+    _ensure_web_guest_principal(request)
+    denial = _respondent_policy_denial(request, survey)
+    if denial:
+        denial['Cache-Control'] = 'private, no-store'
+        return denial
 
     questions = []
     for q in survey.questions.all().order_by('order'):
@@ -268,26 +402,123 @@ def respond_survey_meta(request, uid):
             'title':       survey.title,
             'description': survey.description,
             'is_hmsam':    survey.is_hmsam,
-            'access_code': survey.access_code,
         },
-        'features':  survey.features or {},
+        'features':  survey.features if isinstance(survey.features, dict) else {},
         'questions': questions,
     })
 
 
-def submit_response(request, uid):
+@transaction.atomic
+def _submit_response_once(request, uid):
     if request.method != 'POST':
         return redirect('respond_survey', uid=uid)
 
-    survey = get_object_or_404(Survey, access_uuid=uid, is_active=True)
+    survey = get_object_or_404(Survey, access_uuid=uid, is_active=True, scope_review_required=False)
     user = request.user if request.user.is_authenticated else None
+    web_guest_principal = _ensure_web_guest_principal(request)
+    from feedora_project.api_views import (
+        _attempts_for_principal, _claim_guest_principal, _claimed_guest_ids, _guest_from_request,
+        _normalized_survey_policy, _responses_for_principal, _survey_policy_version, _survey_scope,
+    )
+    from accounts.models import GuestPrincipal
+
+    survey = Survey.objects.select_for_update().get(pk=survey.pk, is_active=True, scope_review_required=False)
+    if user:
+        session_guest = _guest_from_request(request)
+        if session_guest and not _claim_guest_principal(session_guest, user):
+            return render(request, 'surveys/thank_you.html', {
+                'survey': survey,
+                'error': 'This saved guest session belongs to another account.',
+                'points': 0,
+            }, status=409)
+    guest_id = str(web_guest_principal.pk) if not user and web_guest_principal else ''
+    raw_submission_id = str(request.POST.get('submission_id') or '').strip()
+    try:
+        submission_id = str(uuid.UUID(raw_submission_id)) if raw_submission_id else str(uuid.uuid4())
+    except (TypeError, ValueError, AttributeError):
+        return render(request, 'surveys/thank_you.html', {
+            'survey': survey,
+            'error': 'This submission could not be identified. Reload the survey and try again.',
+            'points': 0,
+        }, status=400)
+    canonical_answers = sorted(
+        (key, values)
+        for key, values in request.POST.lists()
+        if key not in ('csrfmiddlewaretoken', 'submission_id')
+    )
+    request_hash = hashlib.sha256(
+        json.dumps(canonical_answers, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+    ).hexdigest()
+    principal_responses = _responses_for_principal(user, guest_id)
+    if user:
+        principal_responses = principal_responses.filter(
+            Q(user=user) | Q(user__isnull=True, guest_participant_id__in=_claimed_guest_ids(user)),
+        )
+    else:
+        principal_responses = principal_responses.filter(user__isnull=True, guest_participant_id=guest_id)
+    previous_receipt = principal_responses.filter(survey=survey, submission_id=submission_id).first()
+    if previous_receipt:
+        if previous_receipt.request_hash and previous_receipt.request_hash != request_hash:
+            return render(request, 'surveys/thank_you.html', {
+                'survey': survey,
+                'error': 'This submission identifier was already used for different answers.',
+                'points': 0,
+            }, status=409)
+        return render(request, 'surveys/thank_you.html', {
+            'survey': survey,
+            'points': previous_receipt.points_earned,
+        }, status=200)
+    policy_version = _survey_policy_version(survey)
+    submitted_policy_version = str(request.POST.get('policy_version') or '').strip()
+    if submitted_policy_version and submitted_policy_version != policy_version:
+        return render(request, 'surveys/thank_you.html', {
+            'survey': survey,
+            'error': 'The survey rules changed after this form opened. Return to the survey and review the current rules before submitting.',
+            'points': 0,
+        }, status=409)
+    if _attempts_for_principal(user, guest_id).filter(
+        survey=survey,
+        status='in_progress',
+    ).exists():
+        return render(request, 'surveys/thank_you.html', {
+            'survey': survey,
+            'error': 'This survey has a saved attempt in progress. Continue it in the app to keep your answers and attempt history together.',
+            'points': 0,
+        }, status=409)
+    denial = _respondent_policy_denial(request, survey)
+    if denial:
+        return render(request, 'surveys/thank_you.html', {
+            'survey': survey,
+            'error': denial.content.decode('utf-8', errors='replace'),
+            'points': 0,
+        }, status=denial.status_code)
+    guest = None if user else GuestPrincipal.objects.filter(pk=guest_id).first()
+    scope = _survey_scope(survey)
+    repeat_reward = _normalized_survey_policy(survey)['access']['rewardStrategy']
+    attempts_used = principal_responses.filter(survey=survey).count()
+    previous_best = (
+        principal_responses.filter(survey=survey)
+        .order_by('-points_earned')
+        .values_list('points_earned', flat=True)
+        .first() or 0
+    ) if attempts_used else 0
 
     from .points import calculate_question_points
 
     def pts(qtype, answer_text=''):
         return calculate_question_points(qtype, survey.features, answer_text)
 
-    response_obj = Response.objects.create(survey=survey, user=user, points_earned=0)
+    response_obj = Response.objects.create(
+        survey=survey,
+        user=user,
+        guest_participant_id=str(guest.pk) if guest else '',
+        submission_id=submission_id,
+        request_hash=request_hash,
+        scope_kind=scope['kind'],
+        scope_id=scope['id'],
+        policy_version=policy_version,
+        points_earned=0,
+    )
     total_points = 0
 
     for question in survey.questions.all().order_by('order'):
@@ -348,6 +579,12 @@ def submit_response(request, uid):
                 Answer.objects.create(response=response_obj, question=question, text_value=val)
                 total_points += pts('date')
 
+    if attempts_used:
+        if repeat_reward in ('first_attempt_only', 'blocked'):
+            total_points = 0
+        elif repeat_reward == 'score_delta':
+            total_points = max(0, total_points - previous_best)
+
     response_obj.points_earned = total_points
     response_obj.save()
 
@@ -381,31 +618,82 @@ def submit_response(request, uid):
 
     return render(request, 'surveys/thank_you.html', {'survey': survey, 'points': total_points})
 
+
+def submit_response(request, uid):
+    """Retry the complete legacy submission transaction after transient SQLite locks."""
+    for attempt in range(8):
+        try:
+            return _submit_response_once(request, uid)
+        except OperationalError as exc:
+            if 'locked' not in str(exc).lower() or attempt == 7:
+                raise
+            time.sleep(0.04 * (1.5 ** attempt))
+
 # This is the latest add_featutres part
 
 @login_required
 def add_features(request, uid):
-    survey = get_object_or_404(Survey, access_uuid=uid, organization=request.user)
+    survey = get_object_or_404(_manageable_surveys(request.user), access_uuid=uid)
  
     if request.method == 'POST':
-        data     = json.loads(request.body)
-        action   = data.get('action', 'save')
-        features = data.get('features', {})
- 
-        survey.features = features
- 
-        # Sync accept responses with is_active
-        collection = features.get('collection', {})
-        if 'accept' in collection:
-            survey.is_active = bool(collection['accept'])
- 
-        if action == 'publish':
-            survey.is_draft  = False
-            survey.is_active = True
+        try:
+            data = json.loads(request.body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JsonResponse({'ok': False, 'code': 'invalid_json', 'error': 'Invalid JSON body.'}, status=400)
+        if not isinstance(data, dict):
+            return JsonResponse({'ok': False, 'code': 'invalid_json', 'error': 'The request body must be an object.'}, status=400)
+        action = data.get('action', 'save')
+        submitted_features = data.get('features', {})
+        if not isinstance(submitted_features, dict):
+            return JsonResponse({'ok': False, 'code': 'invalid_features', 'error': 'Survey features must be an object.'}, status=400)
+        if 'collection' in submitted_features and not isinstance(submitted_features['collection'], dict):
+            return JsonResponse({'ok': False, 'code': 'invalid_features', 'field': 'collection', 'error': 'Collection settings must be an object.'}, status=400)
+
+        with transaction.atomic():
+            survey = Survey.objects.select_for_update().get(pk=survey.pk)
+            current_features_raw = survey.features
+            current_features = current_features_raw if isinstance(current_features_raw, dict) else {}
+            features = dict(submitted_features)
+            # The old feature editor has no participation-policy controls. Preserve
+            # omitted rules and refuse attempts to change them through this route.
+            for key in _POLICY_FEATURE_KEYS:
+                if key not in features and key in current_features:
+                    features[key] = current_features[key]
+            current_collection = current_features.get('collection')
+            next_collection = features.get('collection')
+            if isinstance(current_collection, dict) and 'allow_multiple_submissions' in current_collection:
+                if not isinstance(next_collection, dict):
+                    next_collection = {}
+                    features['collection'] = next_collection
+                if 'allow_multiple_submissions' not in next_collection:
+                    next_collection['allow_multiple_submissions'] = current_collection['allow_multiple_submissions']
+            from surveys.policy import normalize_legacy_features
+            current_policy, current_warnings = normalize_legacy_features(current_features_raw, survey.title, survey.is_hmsam)
+            submitted_policy, submitted_warnings = normalize_legacy_features(features, survey.title, survey.is_hmsam)
+            policy_changed = (
+                _policy_feature_projection(features) != _policy_feature_projection(current_features)
+                or submitted_policy != current_policy
+                or submitted_warnings != current_warnings
+            )
+            if policy_changed:
+                return JsonResponse({
+                    'ok': False,
+                    'code': 'policy_editor_required',
+                    'error': 'Participation rules must be changed through the survey policy editor.',
+                }, status=409)
+
+            survey.features = features
+            collection = features.get('collection', {})
+            if 'accept' in collection:
+                survey.is_active = bool(collection['accept'])
+            if action == 'publish':
+                survey.is_draft = False
+                survey.is_active = True
             survey.save()
-            return JsonResponse({'redirect': f'/surveys/{survey.access_uuid}/dashboard/'})
-        else:
-            survey.save()
+            from feedora_project.api_views import _ensure_policy_revision
+            _ensure_policy_revision(survey, request.user)
+            if action == 'publish':
+                return JsonResponse({'redirect': f'/surveys/{survey.access_uuid}/dashboard/'})
             return JsonResponse({'status': 'ok'})
  
     # GET — pass fresh survey object so template reads latest features
@@ -416,7 +704,18 @@ def add_features(request, uid):
     })
 
 def respond_survey(request, uid):
-    survey       = get_object_or_404(Survey, access_uuid=uid, is_active=True)
+    survey       = get_object_or_404(Survey, access_uuid=uid, is_active=True, scope_review_required=False)
+    _ensure_web_guest_principal(request)
+    denial = _respondent_policy_denial(request, survey)
+    if denial:
+        return HttpResponse(
+            'This survey is not available under its current participation rules. '
+            'Return to the survey link or contact the research team for help.',
+            status=denial.status_code,
+            content_type='text/plain; charset=utf-8',
+        )
+    from feedora_project.api_views import _survey_policy_version
+    policy_version = _survey_policy_version(survey)
     questions_qs = survey.questions.all().order_by('order')
     questions    = []
     seen_sections = set()
@@ -438,7 +737,7 @@ def respond_survey(request, uid):
         questions.append(q)
  
     # Get features with defaults
-    features = survey.features or {}
+    features = survey.features if isinstance(survey.features, dict) else {}
     points_config = features.get('points', {})
     point_values  = points_config.get('values', {})
     mascot_enabled = features.get('mascot', {}).get('enabled', False)
@@ -454,6 +753,8 @@ def respond_survey(request, uid):
  
     return render(request, 'surveys/respond.html', {
         'survey': survey,
+        'submission_id': str(uuid.uuid4()),
+        'policy_version': policy_version,
         'questions': questions,
         'mascot_enabled': mascot_enabled,
         'mascot_position': features.get('mascot', {}).get('position', 'bottom-left'),
@@ -461,7 +762,7 @@ def respond_survey(request, uid):
 
 @login_required
 def edit_survey(request, uid):
-    survey = get_object_or_404(Survey, access_uuid=uid, organization=request.user)
+    survey = get_object_or_404(_manageable_surveys(request.user), access_uuid=uid)
 
     if request.method == 'POST':
         data   = json.loads(request.body)
@@ -604,6 +905,6 @@ def edit_survey(request, uid):
 @login_required
 @require_POST
 def delete_survey(request, uid):
-    survey = get_object_or_404(Survey, access_uuid=uid, organization=request.user)
+    survey = get_object_or_404(_manageable_surveys(request.user), access_uuid=uid)
     survey.delete()
     return redirect('my_surveys')

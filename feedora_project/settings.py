@@ -1,20 +1,42 @@
 import os
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
+from feedora_project.database_config import build_database_config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.environ.get(
-    'DJANGO_SECRET_KEY',
-    'django-insecure-*$9+bas)y6ow=9ryveu!(!0itxz25$etc#r5e834b$wr!#kr(7'
-)
-
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() in ('true', '1', 'yes')
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured('DJANGO_SECRET_KEY must be set when DJANGO_DEBUG is false.')
+    # Development-only fallback. Production must supply a private key through
+    # the PythonAnywhere WSGI environment or another secret manager.
+    SECRET_KEY = 'django-insecure-feedora-local-development-only'
 
 env_hosts = os.environ.get('DJANGO_ALLOWED_HOSTS')
 if env_hosts:
     ALLOWED_HOSTS = [h.strip() for h in env_hosts.split(',') if h.strip()]
 else:
-    ALLOWED_HOSTS = ['*'] if DEBUG else ['localhost', '127.0.0.1']
+    if not DEBUG:
+        raise ImproperlyConfigured('DJANGO_ALLOWED_HOSTS must list the deployed host when DJANGO_DEBUG is false.')
+    ALLOWED_HOSTS = ['*']
+
+csrf_origins = os.environ.get('DJANGO_CSRF_TRUSTED_ORIGINS', '')
+CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in csrf_origins.split(',') if origin.strip()]
+if DEBUG:
+    CSRF_TRUSTED_ORIGINS.extend([
+        'http://localhost:8081',
+        'http://127.0.0.1:8081',
+        'http://localhost:19006',
+        'http://127.0.0.1:19006',
+    ])
+
+# PythonAnywhere terminates HTTPS at its front web server. Trust its forwarded
+# scheme so Django builds secure URLs and marks session/CSRF cookies correctly.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
 
 
 # Apps 
@@ -46,10 +68,11 @@ INSTALLED_APPS = [
 
 # Middleware 
 MIDDLEWARE = [
+    'feedora_project.cors_middleware.LocalExpoCorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
+    'feedora_project.cors_middleware.LocalExpoCsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
@@ -79,16 +102,9 @@ TEMPLATES = [
 WSGI_APPLICATION = 'feedora_project.wsgi.application'
 
 
-# Database 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-        'OPTIONS': {
-            'timeout': 20,
-        },
-    }
-}
+# Database: local SQLite by default; hosted deployments select mysql through
+# DJANGO_DB_ENGINE and provide credentials only through environment settings.
+DATABASES = build_database_config(os.environ, BASE_DIR)
 
 
 # Auth 

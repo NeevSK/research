@@ -2,6 +2,7 @@ import json
 from django.test import TestCase, Client
 from django.contrib.auth import get_user_model
 from surveys.models import Survey
+from accounts.models import Organization
 
 User = get_user_model()
 
@@ -23,8 +24,11 @@ class ApiV1Tests(TestCase):
             role='respondent'
         )
         # Create a test survey
+        organization = Organization.objects.create(created_by=self.admin_user, org_name='API Test Org')
         self.survey = Survey.objects.create(
-            organization=self.admin_user,
+            created_by=self.admin_user,
+            organization_scope=organization,
+            scope_kind='organization',
             title='Sample API Survey',
             is_active=True
         )
@@ -213,6 +217,7 @@ class ApiV1Tests(TestCase):
         self.assertEqual(len(meta_data['questions']), 1)
 
         # 2. Submit response via JSON
+        guest = self.client.post('/api/v1/guest/session/').json()
         submit_payload = {
             'answers': {
                 str(q1.id): 5
@@ -221,7 +226,8 @@ class ApiV1Tests(TestCase):
         submit_resp = self.client.post(
             f'/api/v1/surveys/{self.survey.access_uuid}/submit/',
             data=json.dumps(submit_payload),
-            content_type='application/json'
+            content_type='application/json',
+            HTTP_X_FEEDORA_GUEST_TOKEN=guest['guestToken'],
         )
         self.assertEqual(submit_resp.status_code, 200)
         submit_data = submit_resp.json()

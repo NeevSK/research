@@ -3,7 +3,7 @@ from django.shortcuts import render, redirect
 from django.contrib.auth import authenticate, login
 from django.contrib.auth.hashers import make_password
 from django.core.mail import send_mail
-from .models import User, Organization, EmailVerificationCode, CreatorProfile, RespondentProfile
+from .models import User, Organization, OrganizationMembership, EmailVerificationCode, CreatorProfile, RespondentProfile
 from django.db.models import Sum, Count
 from surveys.models import Survey, Response
 from .utils import get_level_info
@@ -102,7 +102,7 @@ def register_creator(request):
                 is_active=False,
             )
             Organization.objects.create(
-                user=user,
+                created_by=user,
                 org_name=request.POST.get('org_name', ''),
                 org_type=request.POST.get('org_type', ''),
                 user_role=request.POST.get('user_role', ''),
@@ -212,7 +212,7 @@ def creator_profile(request):
         return redirect('creator_profile')
 
     surveys = Survey.objects.filter(
-        organization=request.user
+        created_by=request.user
     ).annotate(resp_count=Count('responses')).order_by('-created_at')
 
     total_responses = sum(s.resp_count for s in surveys)
@@ -256,7 +256,7 @@ def respondent_profile(request):
     points_by_company = {}
     for r in responses:
         try:
-            company = r.survey.organization.creator_profile.company or 'Independent'
+            company = r.survey.created_by.creator_profile.company or 'Independent'
         except CreatorProfile.DoesNotExist:
             company = 'Independent'
         points_by_company[company] = points_by_company.get(company, 0) + r.points_earned
@@ -284,7 +284,11 @@ def my_profile(request):
     user = request.user
 
     # Organization is a OneToOne but may not exist yet — fetch safely.
-    organization = Organization.objects.filter(user=user).first()
+    organization = Organization.objects.filter(
+        memberships__user=user,
+        memberships__role=OrganizationMembership.OWNER,
+        memberships__status=OrganizationMembership.ACTIVE,
+    ).first()
 
     if user.role == User.RESPONDENT:
         profile = RespondentProfile.objects.filter(user=user).first()
@@ -305,4 +309,4 @@ def my_profile(request):
 
 def logout_view(request):
     logout(request)
-    return redirect('login_creator')  
+    return redirect('login_creator')

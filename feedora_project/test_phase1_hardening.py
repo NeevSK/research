@@ -15,7 +15,7 @@ import uuid
 from django.test import TestCase, Client
 from django.contrib.auth import get_user_model
 from surveys.models import Survey, Question, MCQOption, Response, Answer
-from accounts.models import RespondentProfile
+from accounts.models import Organization, RespondentProfile
 
 User = get_user_model()
 
@@ -23,6 +23,8 @@ User = get_user_model()
 class Phase1DataIntegrityTests(TestCase):
     def setUp(self):
         self.client = Client()
+        guest = self.client.post('/api/v1/guest/session/').json()
+        self.client.defaults['HTTP_X_FEEDORA_GUEST_TOKEN'] = guest['guestToken']
         self.creator = User.objects.create_user(
             username='lab_lead@feedora.org',
             email='lab_lead@feedora.org',
@@ -30,8 +32,15 @@ class Phase1DataIntegrityTests(TestCase):
             role='creator',
             is_active=True,
         )
+        self.organization = Organization.objects.create(
+            created_by=self.creator,
+            org_name='University of Moratuwa',
+            org_type='university',
+        )
         self.survey = Survey.objects.create(
-            organization=self.creator,
+            created_by=self.creator,
+            organization_scope=self.organization,
+            scope_kind='organization',
             title='Empirical HMSAM Study',
             is_active=True,
             features={'points': {'enabled': True, 'values': {'likert': 15}}}
@@ -221,6 +230,7 @@ class Phase1DataIntegrityTests(TestCase):
         self.assertEqual(meta_res.status_code, 200)
         token = meta_res.json().get('csrfToken')
         self.assertTrue(token)
+        guest = csrf_client.post('/api/v1/guest/session/').json()
 
         # 2. Submitting without X-CSRFToken header should return 403 Forbidden
         submit_url = f'/api/v1/surveys/{self.survey.access_uuid}/submit/'
@@ -238,20 +248,14 @@ class Phase1DataIntegrityTests(TestCase):
             data=json.dumps(payload),
             content_type='application/json',
             HTTP_X_CSRFTOKEN=token,
+            HTTP_X_FEEDORA_GUEST_TOKEN=guest['guestToken'],
         )
         self.assertEqual(res_with_token.status_code, 200)
         self.assertTrue(res_with_token.json()['ok'])
 
     def test_entities_list_and_surveys(self):
         """Entities list endpoint returns active organizations and their surveys."""
-        from accounts.models import Organization
-        org = Organization.objects.create(
-            user=self.creator,
-            org_name='University of Moratuwa',
-            org_type='university',
-            user_role='Lead Researcher',
-            country='Sri Lanka',
-        )
+        org = self.organization
 
         res = self.client.get('/api/v1/entities/')
         self.assertEqual(res.status_code, 200)
@@ -270,7 +274,7 @@ class Phase1DataIntegrityTests(TestCase):
         """Respondent can join an organization, updating both Organization and RespondentProfile."""
         from accounts.models import Organization
         org = Organization.objects.create(
-            user=self.creator,
+            created_by=self.creator,
             org_name='MIT Media Lab',
             org_type='research',
             country='USA',
@@ -296,12 +300,8 @@ class Phase1DataIntegrityTests(TestCase):
     def test_respondent_history_badges_and_points_by_organization(self):
         """History endpoint returns cumulative points, level info, badges, and per-organization aggregation."""
         from accounts.models import Organization
-        Organization.objects.create(
-            user=self.creator,
-            org_name='University of Colombo',
-            org_type='university',
-            country='Sri Lanka',
-        )
+        self.organization.org_name = 'University of Colombo'
+        self.organization.save(update_fields=['org_name'])
         user = User.objects.create_user(
             username='badge_earner@feedora.org',
             email='badge_earner@feedora.org',
@@ -333,7 +333,9 @@ class Phase1DataIntegrityTests(TestCase):
         from surveys.analytics import get_hmsam_scores
 
         s7 = Survey.objects.create(
-            organization=self.creator,
+            created_by=self.creator,
+            organization_scope=self.organization,
+            scope_kind='organization',
             title='7-Point Likert Study',
             is_active=True,
         )
@@ -383,6 +385,8 @@ class Phase1DataIntegrityTests(TestCase):
 
     def test_server_side_analysis_api_and_csv_export(self):
         """Analysis API returns per-construct scores and arm comparisons; export endpoint returns CSV."""
+        self.survey.features['allow_multiple_submissions'] = True
+        self.survey.save(update_fields=['features'])
         # Create second question to support construct reliability
         q_joy2 = Question.objects.create(
             survey=self.survey,
@@ -412,6 +416,7 @@ class Phase1DataIntegrityTests(TestCase):
         }), content_type='application/json')
 
         # Test analysis endpoint
+        self.client.force_login(self.creator)
         analysis_url = f'/api/v1/surveys/{self.survey.access_uuid}/analysis/'
         analysis_res = self.client.get(analysis_url)
         self.assertEqual(analysis_res.status_code, 200)
@@ -499,6 +504,8 @@ class Phase1DataIntegrityTests(TestCase):
 
     def test_statistical_significance_welch_t_and_hedges_g(self):
         """Arm analysis computes Welch's t-test, p-value, and Hedges' g between arms."""
+        self.survey.features['allow_multiple_submissions'] = True
+        self.survey.save(update_fields=['features'])
         q_joy2 = Question.objects.create(
             survey=self.survey,
             code='JOY2_STAT',
@@ -528,6 +535,7 @@ class Phase1DataIntegrityTests(TestCase):
                 'answers': {'JOY1': val, 'JOY2_STAT': val},
             }), content_type='application/json')
 
+        self.client.force_login(self.creator)
         analysis_url = f'/api/v1/surveys/{self.survey.access_uuid}/analysis/'
         res = self.client.get(analysis_url)
         self.assertEqual(res.status_code, 200)

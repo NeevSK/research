@@ -945,6 +945,7 @@ function buildPayload(action){
 
   return {
     action:       action,
+    organization_id: document.getElementById('organizationScopeSelect')?.value || '',
     title:        document.getElementById('formTitle').value.trim()||'Untitled Survey',
     description:  document.getElementById('formDesc').value.trim(),
     theme_accent: accentColor,
@@ -975,6 +976,45 @@ function buildPayload(action){
 
 function bindPublish(){
   document.getElementById('btnPublish')?.addEventListener('click', publishSurvey);
+  document.getElementById('createOrganizationButton')?.addEventListener('click', createOrganizationScope);
+}
+
+async function createOrganizationScope(){
+  const input = document.getElementById('newOrganizationName');
+  const select = document.getElementById('organizationScopeSelect');
+  const status = document.getElementById('saveStatus');
+  const name = input?.value.trim();
+  if (!name){
+    if (status) status.textContent = 'Enter an organization name first.';
+    input?.focus();
+    return;
+  }
+  const button = document.getElementById('createOrganizationButton');
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch(_d.create_organization_url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {'Content-Type': 'application/json', 'X-CSRFToken': CSRF_TOKEN},
+      body: JSON.stringify({name, type: 'research'}),
+    });
+    const data = await response.json();
+    if (!response.ok || !data?.entity?.id){
+      if (status) status.textContent = data?.error || 'Could not create organization.';
+      return;
+    }
+    const option = document.createElement('option');
+    option.value = String(data.entity.id);
+    option.textContent = data.entity.name;
+    select?.append(option);
+    if (select) select.value = option.value;
+    if (input) input.value = '';
+    if (status) status.textContent = 'Organization created.';
+  } catch {
+    if (status) status.textContent = 'Network error while creating organization.';
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 async function publishSurvey(){
@@ -1003,7 +1043,7 @@ async function publishSurvey(){
       window.clearBuilderDirty?.();
       window.location.href = data.redirect;
     } else {
-      if (st) st.textContent = 'Error — please try again.';
+      if (st) st.textContent = data?.error || 'Error — please try again.';
     }
 
   } catch(err){
@@ -1029,7 +1069,7 @@ async function saveAsDraft(){
       window.clearBuilderDirty?.();
       window.location.href = data.redirect;
     } else {
-      if (st) st.textContent = 'Error — please try again.';
+      if (st) st.textContent = data?.error || 'Error — please try again.';
     }
   } catch(err){
     if (st) st.textContent = 'Network error.';

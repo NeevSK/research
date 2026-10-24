@@ -18,6 +18,19 @@
     <input class="form-name-input" id="surveyNameInput"
            value="{% if is_hmsam %}HMSAM Survey{% else %}Untitled{% endif %}"
            placeholder="Survey name">
+    <label class="form-name-input" for="organizationScopeSelect" style="display:flex;align-items:center;gap:6px;">
+      <span>Save to</span>
+      <select id="organizationScopeSelect" aria-label="Survey organization">
+        <option value="">Choose organization</option>
+        {% for membership in owned_organizations %}
+        <option value="{{ membership.organization_id }}" {% if selected_org_id == membership.organization_id|stringformat:'s' %}selected{% endif %}>{{ membership.organization.org_name|default:'Research organization' }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <span style="display:flex;align-items:center;gap:4px;">
+      <input id="newOrganizationName" aria-label="New organization name" placeholder="New organization" style="width:130px;">
+      <button id="createOrganizationButton" type="button" aria-label="Create organization">Add</button>
+    </span>
     <span class="save-status" id="saveStatus"></span>
   </div>
 
@@ -346,6 +359,8 @@
 {
   "is_hmsam":        {% if is_hmsam %}true{% else %}false{% endif %},
   "hmsam_questions": {{ hmsam_questions_json|safe }},
+  "selected_org_id": "{{ selected_org_id|escapejs }}",
+  "create_organization_url": "{% url 'api_entity_create' %}",
   "save_url":        "{% if save_url %}{{ save_url }}{% else %}{% url 'create_survey' survey_type %}{% endif %}",
   "csrf_token":      "{{ csrf_token }}"
 }

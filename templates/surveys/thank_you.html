@@ -90,6 +90,18 @@ body{font-family:var(--sans);font-size:14px;color:var(--ink);
 
 <div class="card">
 
+  {% if error %}
+  <div class="check-icon" style="background:#fff7ed;">
+    <svg width="28" height="28" viewBox="0 0 24 24" fill="none"
+         stroke="#c2410c" stroke-width="2.5" stroke-linecap="round">
+      <path d="M12 8v4m0 4h.01"/><circle cx="12" cy="12" r="10"/>
+    </svg>
+  </div>
+  <h1 class="thank-title">Response not submitted</h1>
+  <p class="thank-desc">{{ error }}</p>
+  <a href="/surveys/access/" class="done-btn">Return to surveys</a>
+  {% else %}
+
   <!-- FIX: Show mascot thank you message on this page -->
   {% if survey.features.mascot.enabled %}
   <div class="thankyou-mascot">
@@ -135,6 +147,7 @@ body{font-family:var(--sans);font-size:14px;color:var(--ink);
   {% endif %}
 
   <a href="/surveys/access/" class="done-btn">Done</a>
+  {% endif %}
 
 </div>
 </body>
